@@ -163,11 +163,11 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
     if not GAMMA_API_KEY:
         return {"error": "No GAMMA_API_KEY set", "gamma_url": None, "file_path": None}
 
-    content = await format_deck_for_gamma(deck_plan)
+    input_text = await format_deck_for_gamma(deck_plan)
     tone_map = {
-        "professional": "professional and polished",
-        "minimal": "clean and minimal",
-        "bold": "bold and high-contrast",
+        "professional": "professional",
+        "minimal": "casual",
+        "bold": "bold",
     }
 
     async with httpx.AsyncClient(timeout=180.0) as client:
@@ -179,9 +179,14 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                 "Content-Type": "application/json",
             },
             json={
-                "content": content,
-                "tone": tone_map.get(theme, "professional and polished"),
-                "output_format": "presentation",
+                "inputText": input_text,
+                "format": "presentation",
+                "textMode": "preserve",
+                "exportAs": "pptx",
+                "textOptions": {
+                    "tone": tone_map.get(theme, "professional"),
+                    "amount": "detailed",
+                },
             },
         )
         resp.raise_for_status()
@@ -203,8 +208,8 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
             status = status_resp.json()
 
             if status.get("status") == "completed":
-                download_url = status.get("download_url")
-                gamma_url = status.get("url")
+                download_url = status.get("download_url") or status.get("exportUrl")
+                gamma_url = status.get("url") or status.get("gammaUrl")
 
                 file_path = None
                 if download_url:
