@@ -610,7 +610,7 @@ function handleEvent(e) {
         html += '<a class="dl-btn" href="'+e.gamma_url+'" target="_blank">Edit in Gamma</a>';
       } else if (e.gamma_content) {
         html += '<h2 class="result-header">Deck Ready — Copy to Gamma</h2>';
-        html += '<p class="result-hint">Paste this into Gamma\'s "Import document" or "Paste content" to generate your slides.</p>';
+        html += '<p class="result-hint">Paste this into Gamma (Import document or Paste content) to generate your slides.</p>';
         html += '<textarea class="gamma-content" id="gammaContent" readonly>'+esc(e.gamma_content)+'</textarea>';
         html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
         html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;">Copied!</span>';
