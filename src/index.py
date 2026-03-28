@@ -173,9 +173,9 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
     async with httpx.AsyncClient(timeout=180.0) as client:
         # Start generation
         resp = await client.post(
-            "https://api.gamma.app/api/v1/generations",
+            "https://public-api.gamma.app/v1.0/generations",
             headers={
-                "Authorization": f"Bearer {GAMMA_API_KEY}",
+                "X-API-KEY": GAMMA_API_KEY,
                 "Content-Type": "application/json",
             },
             json={
@@ -196,8 +196,8 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         for _ in range(40):  # 40 * 3s = 120s max
             await asyncio.sleep(3)
             status_resp = await client.get(
-                f"https://api.gamma.app/api/v1/generations/{gen_id}",
-                headers={"Authorization": f"Bearer {GAMMA_API_KEY}"},
+                f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
+                headers={"X-API-KEY": GAMMA_API_KEY},
             )
             status_resp.raise_for_status()
             status = status_resp.json()
@@ -262,9 +262,30 @@ async def generate(request: Request):
             yield f"data: {json.dumps({'event': 'error', 'message': 'Pipeline failed to produce a deck plan'})}\n\n"
             return
 
-        # Format deck content for Gamma paste
+        # Format content for Gamma (used for both API and copy fallback)
         gamma_text = await format_deck_for_gamma(deck_plan)
-        yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text, 'deck_plan': deck_plan})}\n\n"
+
+        # Try Gamma API
+        if GAMMA_API_KEY:
+            yield f"data: {json.dumps({'event': 'agent_start', 'agent': 'gamma', 'message': 'Gamma Design Engine: Creating professional slides...'})}\n\n"
+            try:
+                gamma_result = await generate_via_gamma(deck_plan, req.theme)
+                if gamma_result.get("error"):
+                    yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': gamma_result['error']})}\n\n"
+                    # Fallback: show copyable content
+                    yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
+                else:
+                    job_id = str(uuid.uuid4())
+                    if gamma_result.get("file_path"):
+                        JOBS[job_id] = gamma_result["file_path"]
+                    yield f"data: {json.dumps({'event': 'agent_complete', 'agent': 'gamma', 'message': 'Gamma design complete'})}\n\n"
+                    yield f"data: {json.dumps({'event': 'complete', 'job_id': job_id, 'gamma_url': gamma_result.get('gamma_url')})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': str(e)})}\n\n"
+                yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
+        else:
+            # No API key — show copyable content
+            yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -577,11 +598,21 @@ function handleEvent(e) {
     case 'complete': {
       const r = document.getElementById('result');
       r.classList.add('active');
-      let html = '<h2 class="result-header">Deck Ready — Copy to Gamma</h2>';
-      html += '<p class="result-hint">Paste this into Gamma\'s "Import document" or "Paste content" to generate your slides.</p>';
-      html += '<textarea class="gamma-content" id="gammaContent" readonly>'+esc(e.gamma_content || '')+'</textarea>';
-      html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
-      html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;">Copied!</span>';
+      let html = '';
+      if (e.gamma_url) {
+        html += '<h2 class="result-header">Deck Ready</h2>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+e.job_id+'" style="margin-right:0.75rem;">Download PPTX</a>';
+        html += '<a class="dl-btn" href="'+e.gamma_url+'" target="_blank">Edit in Gamma</a>';
+      } else if (e.gamma_content) {
+        html += '<h2 class="result-header">Deck Ready — Copy to Gamma</h2>';
+        html += '<p class="result-hint">Paste this into Gamma\'s "Import document" or "Paste content" to generate your slides.</p>';
+        html += '<textarea class="gamma-content" id="gammaContent" readonly>'+esc(e.gamma_content)+'</textarea>';
+        html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
+        html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;">Copied!</span>';
+      } else {
+        html += '<h2 class="result-header">Deck Ready</h2>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+e.job_id+'">Download PPTX</a>';
+      }
       r.innerHTML = html;
       break;
     }
