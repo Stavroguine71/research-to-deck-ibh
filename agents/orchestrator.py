@@ -1,18 +1,15 @@
 """
 ORCHESTRATOR — Multi-Agent Research-to-Deck Pipeline
 =====================================================
-Optimized for Vercel's 300s function timeout.
+Railway deployment — no timeout constraints.
 
-Pipeline (~180s total):
-  1. Researcher — 4 parallel Tavily queries (~5s)
-  2. Brief Agent (~20s) → Validator (~8s)
-  3. Architect Agent (~20s)
-  4. Writer Agent (~40s)
-  5. Reviewer Agent (~50s)
-  6. Gamma API (~30s)
-
-No retries — each agent gets one shot to stay within timeout.
-Validator only on the Brief pass (most impactful gate).
+Full pipeline with validation gates and retries:
+  1. Researcher — 4 parallel Tavily queries
+  2. Brief Agent → Validator (retry on fail)
+  3. Architect Agent → Validator (retry on fail)
+  4. Writer Agent → Validator (retry on fail)
+  5. Reviewer Agent — final quality gate with rewrites
+  6. Output → Gamma API for design
 """
 
 import json
@@ -34,6 +31,75 @@ writer_agent = WriterAgent()
 reviewer_agent = ReviewerAgent()
 validator = ValidatorAgent()
 
+MAX_RETRIES = 1  # One retry per pass if validation fails
+
+
+async def _run_with_validation(
+    agent_name: str,
+    agent_fn,
+    next_agent: str,
+    pipeline_start: float,
+) -> tuple:
+    """
+    Helper: run an agent, validate its output, retry once if rejected.
+    Returns (result, events_list).
+    """
+    events = []
+
+    def elapsed():
+        return round(time.time() - pipeline_start, 1)
+
+    result = None
+    for attempt in range(1 + MAX_RETRIES):
+        label = " (retry)" if attempt > 0 else ""
+
+        # Run the agent
+        events.append({
+            "event": "agent_start",
+            "agent": agent_name,
+            "message": f"{agent_name.title()} Agent{label} running... ({elapsed()}s)",
+        })
+        try:
+            result = await agent_fn()
+        except Exception as e:
+            events.append({"event": "agent_error", "agent": agent_name, "message": str(e)})
+            if attempt == MAX_RETRIES:
+                return None, events
+            continue
+
+        events.append({
+            "event": "agent_complete",
+            "agent": agent_name,
+            "message": f"{agent_name.title()} done ({elapsed()}s)",
+        })
+
+        # Validate
+        events.append({"event": "validating", "agent": "validator", "message": f"Validating {agent_name} output..."})
+        try:
+            v = await validator.run(agent_name, result, expected_by=next_agent)
+            if v["verdict"] == "pass":
+                events.append({
+                    "event": "validated",
+                    "agent": "validator",
+                    "message": f"Validated — score {v['score']}/10 ({elapsed()}s)",
+                })
+                break
+            else:
+                issues = "; ".join(v.get("issues", [])[:2])
+                events.append({
+                    "event": "rejected",
+                    "agent": "validator",
+                    "message": f"Rejected (score {v['score']}/10): {issues} ({elapsed()}s)",
+                })
+                if attempt == MAX_RETRIES:
+                    events.append({"event": "warning", "message": "Proceeding despite validation failure"})
+                    break
+        except Exception:
+            events.append({"event": "validated", "agent": "validator", "message": f"Validator skipped ({elapsed()}s)"})
+            break
+
+    return result, events
+
 
 async def run_pipeline(
     topic: str,
@@ -44,8 +110,8 @@ async def run_pipeline(
     depth: str = "standard",
 ) -> AsyncGenerator[dict, None]:
     """
-    Run the full multi-agent pipeline with streaming status events.
-    Optimized to complete within Vercel's 300s timeout.
+    Full multi-agent pipeline with validation loops.
+    No timeout constraints — Railway runs a persistent server.
     """
     pipeline_start = time.time()
 
@@ -58,92 +124,78 @@ async def run_pipeline(
         "agent": "researcher",
         "message": "Research Agent: Running 4 search queries in parallel...",
     }
-
     try:
         research_data = await researcher.run(topic)
         yield {
             "event": "agent_complete",
             "agent": "researcher",
-            "message": f"Research done — {research_data['total_results']} results ({elapsed()}s)",
+            "message": f"Research done — {research_data['total_results']} results from {research_data['queries_succeeded']}/4 queries ({elapsed()}s)",
         }
     except Exception as e:
         yield {"event": "agent_error", "agent": "researcher", "message": str(e)}
         return
 
-    # ===== PHASE 2: BRIEF + Validation =====
+    # ===== PHASE 2: BRIEF + Validation (with retry) =====
+    brief, events = await _run_with_validation(
+        "brief",
+        lambda: brief_agent.run(research_data, audience_context),
+        "architect",
+        pipeline_start,
+    )
+    for e in events:
+        yield e
+    if brief is None:
+        return
+
+    findings_count = len(brief.get("findings", []))
     yield {
-        "event": "agent_start",
+        "event": "agent_complete",
         "agent": "brief",
-        "message": "Brief Agent: Synthesizing research into structured brief...",
+        "message": f"Brief finalized — {findings_count} findings, confidence: {brief.get('confidence', '?')} ({elapsed()}s)",
     }
-    try:
-        brief = await brief_agent.run(research_data, audience_context)
-        yield {
-            "event": "agent_complete",
-            "agent": "brief",
-            "message": f"Brief done — {len(brief.get('findings', []))} findings ({elapsed()}s)",
-        }
-    except Exception as e:
-        yield {"event": "agent_error", "agent": "brief", "message": str(e)}
+
+    # ===== PHASE 3: ARCHITECT + Validation (with retry) =====
+    outline, events = await _run_with_validation(
+        "architect",
+        lambda: architect_agent.run(brief, audience_context, narrative, num_slides, tone, depth),
+        "writer",
+        pipeline_start,
+    )
+    for e in events:
+        yield e
+    if outline is None:
         return
 
-    # Validate the brief — most impactful gate (garbage in = garbage out)
-    yield {"event": "validating", "agent": "validator", "message": "Validator checking brief quality..."}
-    try:
-        v = await validator.run("brief", brief, expected_by="architect")
-        if v["verdict"] == "pass":
-            yield {"event": "validated", "agent": "validator", "message": f"Brief validated — score {v['score']}/10 ({elapsed()}s)"}
-        else:
-            yield {
-                "event": "rejected",
-                "agent": "validator",
-                "message": f"Brief weak (score {v['score']}/10) — proceeding anyway ({elapsed()}s)",
-            }
-    except Exception:
-        yield {"event": "validated", "agent": "validator", "message": f"Validator skipped ({elapsed()}s)"}
-
-    # ===== PHASE 3: ARCHITECT =====
+    slide_count = len(outline.get("slides", []))
     yield {
-        "event": "agent_start",
+        "event": "agent_complete",
         "agent": "architect",
-        "message": f"Architect: Designing {num_slides}-slide deck with {narrative.upper()} narrative...",
+        "message": f"Outline finalized — {slide_count} slides with {narrative.upper()} arc ({elapsed()}s)",
     }
-    try:
-        outline = await architect_agent.run(
-            brief, audience_context, narrative, num_slides, tone, depth
-        )
-        slide_count = len(outline.get("slides", []))
-        yield {
-            "event": "agent_complete",
-            "agent": "architect",
-            "message": f"Architect done — {slide_count} slides designed ({elapsed()}s)",
-        }
-    except Exception as e:
-        yield {"event": "agent_error", "agent": "architect", "message": str(e)}
+
+    # ===== PHASE 4: WRITER + Validation (with retry) =====
+    content, events = await _run_with_validation(
+        "writer",
+        lambda: writer_agent.run(outline, brief, audience_context),
+        "reviewer",
+        pipeline_start,
+    )
+    for e in events:
+        yield e
+    if content is None:
         return
 
-    # ===== PHASE 4: WRITER =====
     yield {
-        "event": "agent_start",
+        "event": "agent_complete",
         "agent": "writer",
-        "message": "Writer: Filling slides with data-backed content and speaker notes...",
+        "message": f"Content finalized — {len(content.get('slides', []))} slides written ({elapsed()}s)",
     }
-    try:
-        content = await writer_agent.run(outline, brief, audience_context)
-        yield {
-            "event": "agent_complete",
-            "agent": "writer",
-            "message": f"Writer done — {len(content.get('slides', []))} slides written ({elapsed()}s)",
-        }
-    except Exception as e:
-        yield {"event": "agent_error", "agent": "writer", "message": str(e)}
-        return
 
     # ===== PHASE 5: REVIEWER — Final Quality Gate =====
     yield {
         "event": "agent_start",
         "agent": "reviewer",
-        "message": "Senior Partner reviewing — scoring and rewriting weak slides...",
+        "message": "Senior Partner reviewing all slides — scoring and rewriting weak ones...",
     }
     try:
         review = await reviewer_agent.run(content, brief)
@@ -152,17 +204,15 @@ async def run_pipeline(
         yield {
             "event": "agent_complete",
             "agent": "reviewer",
-            "message": f"Review done — score {overall}/10, {rewritten} rewritten ({elapsed()}s)",
+            "message": f"Review done — score {overall}/10, {rewritten} slides rewritten ({elapsed()}s)",
         }
     except Exception as e:
         yield {"event": "agent_error", "agent": "reviewer", "message": str(e)}
-        # Fall back to unreviewed content
         review = content
         review["overall_score"] = "N/A"
 
     total_elapsed = round(time.time() - pipeline_start, 1)
 
-    # Build the final deck plan
     final_plan = {
         "title": topic,
         "story_spine": outline.get("story_spine", ""),
@@ -177,6 +227,7 @@ async def run_pipeline(
             "agents_ran": 6,
             "research_results": research_data["total_results"],
             "slides_rewritten": review.get("slides_rewritten", 0),
+            "validation_passes": 3,
         },
     }
 

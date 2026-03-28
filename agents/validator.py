@@ -71,9 +71,8 @@ Output to validate:
         result = await call_claude(
             system_prompt=self.SYSTEM_PROMPT,
             user_message=user_msg,
-            model="claude-sonnet-4-20250514",
-            thinking_budget=0,
-            max_tokens=1500,
+            thinking_budget=4000,
+            max_tokens=2000,
         )
 
         validation = parse_json_response(result["text"])

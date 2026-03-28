@@ -49,8 +49,8 @@ Rules:
         result = await call_claude(
             system_prompt=self.SYSTEM_PROMPT,
             user_message=user_msg,
-            thinking_budget=4000,
-            max_tokens=4000,
+            thinking_budget=8000,
+            max_tokens=6000,
         )
 
         brief = parse_json_response(result["text"])
