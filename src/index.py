@@ -586,6 +586,9 @@ function handleEvent(e) {
     case 'rejected':
       updateLastRow('rejected', e.message);
       break;
+    case 'heartbeat':
+      updateLastRow('running', e.message);
+      break;
     case 'warning':
       addAgentRow('warning', e.message, 'rejected');
       break;

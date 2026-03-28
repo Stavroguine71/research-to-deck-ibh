@@ -18,7 +18,7 @@ async def call_claude(
     model: str = DEFAULT_MODEL,
     max_tokens: int = 6000,
     thinking_budget: int = 8000,
-    timeout: float = 240.0,
+    timeout: float = 600.0,
 ) -> dict:
     """
     Make an independent Claude API call.

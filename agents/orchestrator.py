@@ -3,7 +3,7 @@ ORCHESTRATOR — Multi-Agent Research-to-Deck Pipeline
 =====================================================
 Railway deployment — no timeout constraints.
 
-Full pipeline with validation gates and retries:
+Full pipeline with validation gates, retries, and SSE heartbeats:
   1. Researcher — 4 parallel Tavily queries
   2. Brief Agent → Validator (retry on fail)
   3. Architect Agent → Validator (retry on fail)
@@ -14,6 +14,7 @@ Full pipeline with validation gates and retries:
 
 import json
 import time
+import asyncio
 from typing import AsyncGenerator
 from . import (
     ResearcherAgent,
@@ -32,73 +33,47 @@ reviewer_agent = ReviewerAgent()
 validator = ValidatorAgent()
 
 MAX_RETRIES = 1  # One retry per pass if validation fails
+HEARTBEAT_INTERVAL = 15  # seconds between keep-alive pings
 
 
-async def _run_with_validation(
-    agent_name: str,
-    agent_fn,
-    next_agent: str,
-    pipeline_start: float,
-) -> tuple:
+async def _run_with_heartbeat(agent_fn, agent_name: str, pipeline_start: float):
     """
-    Helper: run an agent, validate its output, retry once if rejected.
-    Returns (result, events_list).
+    Async generator: runs agent_fn as a background task and yields
+    heartbeat events every HEARTBEAT_INTERVAL seconds to keep the
+    SSE connection alive.
+
+    Final yield is {"_result": <agent output>} or raises on error.
     """
-    events = []
+    result_holder = {"value": None, "error": None, "done": False}
 
-    def elapsed():
-        return round(time.time() - pipeline_start, 1)
-
-    result = None
-    for attempt in range(1 + MAX_RETRIES):
-        label = " (retry)" if attempt > 0 else ""
-
-        # Run the agent
-        events.append({
-            "event": "agent_start",
-            "agent": agent_name,
-            "message": f"{agent_name.title()} Agent{label} running... ({elapsed()}s)",
-        })
+    async def _work():
         try:
-            result = await agent_fn()
+            result_holder["value"] = await agent_fn()
         except Exception as e:
-            events.append({"event": "agent_error", "agent": agent_name, "message": str(e)})
-            if attempt == MAX_RETRIES:
-                return None, events
-            continue
+            result_holder["error"] = e
+        finally:
+            result_holder["done"] = True
 
-        events.append({
-            "event": "agent_complete",
-            "agent": agent_name,
-            "message": f"{agent_name.title()} done ({elapsed()}s)",
-        })
+    task = asyncio.create_task(_work())
 
-        # Validate
-        events.append({"event": "validating", "agent": "validator", "message": f"Validating {agent_name} output..."})
+    while not result_holder["done"]:
         try:
-            v = await validator.run(agent_name, result, expected_by=next_agent)
-            if v["verdict"] == "pass":
-                events.append({
-                    "event": "validated",
-                    "agent": "validator",
-                    "message": f"Validated — score {v['score']}/10 ({elapsed()}s)",
-                })
-                break
-            else:
-                issues = "; ".join(v.get("issues", [])[:2])
-                events.append({
-                    "event": "rejected",
-                    "agent": "validator",
-                    "message": f"Rejected (score {v['score']}/10): {issues} ({elapsed()}s)",
-                })
-                if attempt == MAX_RETRIES:
-                    events.append({"event": "warning", "message": "Proceeding despite validation failure"})
-                    break
-        except Exception:
-            events.append({"event": "validated", "agent": "validator", "message": f"Validator skipped ({elapsed()}s)"})
-            break
+            await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            elapsed = round(time.time() - pipeline_start, 1)
+            yield {
+                "event": "heartbeat",
+                "agent": agent_name,
+                "message": f"{agent_name.title()} still working... ({elapsed}s)",
+            }
 
-    return result, events
+    # Make sure the task is truly done
+    await task
+
+    if result_holder["error"]:
+        raise result_holder["error"]
+
+    yield {"_result": result_holder["value"]}
 
 
 async def run_pipeline(
@@ -110,7 +85,7 @@ async def run_pipeline(
     depth: str = "standard",
 ) -> AsyncGenerator[dict, None]:
     """
-    Full multi-agent pipeline with validation loops.
+    Full multi-agent pipeline with validation loops and real-time heartbeats.
     No timeout constraints — Railway runs a persistent server.
     """
     pipeline_start = time.time()
@@ -135,70 +110,145 @@ async def run_pipeline(
         yield {"event": "agent_error", "agent": "researcher", "message": str(e)}
         return
 
-    # ===== PHASE 2: BRIEF + Validation (with retry) =====
-    brief, events = await _run_with_validation(
-        "brief",
-        lambda: brief_agent.run(research_data, audience_context),
-        "architect",
-        pipeline_start,
-    )
-    for e in events:
-        yield e
-    if brief is None:
-        return
+    # ===== PHASE 2-4: Sequential agents with validation =====
+    # Each tuple: (name, factory for agent_fn, next_agent_name, summary_fn)
+    phases = [
+        (
+            "brief",
+            lambda: brief_agent.run(research_data, audience_context),
+            "architect",
+        ),
+        (
+            "architect",
+            lambda: architect_agent.run(
+                brief_result, audience_context, narrative, num_slides, tone, depth
+            ),
+            "writer",
+        ),
+        (
+            "writer",
+            lambda: writer_agent.run(outline_result, brief_result, audience_context),
+            "reviewer",
+        ),
+    ]
 
-    findings_count = len(brief.get("findings", []))
-    yield {
-        "event": "agent_complete",
-        "agent": "brief",
-        "message": f"Brief finalized — {findings_count} findings, confidence: {brief.get('confidence', '?')} ({elapsed()}s)",
-    }
+    brief_result = None
+    outline_result = None
+    content_result = None
 
-    # ===== PHASE 3: ARCHITECT + Validation (with retry) =====
-    outline, events = await _run_with_validation(
-        "architect",
-        lambda: architect_agent.run(brief, audience_context, narrative, num_slides, tone, depth),
-        "writer",
-        pipeline_start,
-    )
-    for e in events:
-        yield e
-    if outline is None:
-        return
+    for phase_name, agent_fn_factory, next_agent in phases:
+        result = None
+        for attempt in range(1 + MAX_RETRIES):
+            label = " (retry)" if attempt > 0 else ""
 
-    slide_count = len(outline.get("slides", []))
-    yield {
-        "event": "agent_complete",
-        "agent": "architect",
-        "message": f"Outline finalized — {slide_count} slides with {narrative.upper()} arc ({elapsed()}s)",
-    }
+            yield {
+                "event": "agent_start",
+                "agent": phase_name,
+                "message": f"{phase_name.title()} Agent{label} running... ({elapsed()}s)",
+            }
 
-    # ===== PHASE 4: WRITER + Validation (with retry) =====
-    content, events = await _run_with_validation(
-        "writer",
-        lambda: writer_agent.run(outline, brief, audience_context),
-        "reviewer",
-        pipeline_start,
-    )
-    for e in events:
-        yield e
-    if content is None:
-        return
+            # Run agent with heartbeats streaming in real-time
+            try:
+                async for event in _run_with_heartbeat(
+                    agent_fn_factory, phase_name, pipeline_start
+                ):
+                    if "_result" in event:
+                        result = event["_result"]
+                    else:
+                        yield event  # heartbeat — streams immediately
+            except Exception as e:
+                yield {"event": "agent_error", "agent": phase_name, "message": str(e)}
+                if attempt == MAX_RETRIES:
+                    result = None
+                    break
+                continue
 
-    yield {
-        "event": "agent_complete",
-        "agent": "writer",
-        "message": f"Content finalized — {len(content.get('slides', []))} slides written ({elapsed()}s)",
-    }
+            yield {
+                "event": "agent_complete",
+                "agent": phase_name,
+                "message": f"{phase_name.title()} done ({elapsed()}s)",
+            }
 
-    # ===== PHASE 5: REVIEWER — Final Quality Gate =====
+            # Validate
+            yield {
+                "event": "validating",
+                "agent": "validator",
+                "message": f"Validating {phase_name} output...",
+            }
+            try:
+                v = await validator.run(phase_name, result, expected_by=next_agent)
+                if v["verdict"] == "pass":
+                    yield {
+                        "event": "validated",
+                        "agent": "validator",
+                        "message": f"Validated — score {v['score']}/10 ({elapsed()}s)",
+                    }
+                    break
+                else:
+                    issues = "; ".join(v.get("issues", [])[:2])
+                    yield {
+                        "event": "rejected",
+                        "agent": "validator",
+                        "message": f"Rejected (score {v['score']}/10): {issues} ({elapsed()}s)",
+                    }
+                    if attempt == MAX_RETRIES:
+                        yield {"event": "warning", "message": "Proceeding despite validation failure"}
+                        break
+            except Exception:
+                yield {
+                    "event": "validated",
+                    "agent": "validator",
+                    "message": f"Validator skipped ({elapsed()}s)",
+                }
+                break
+
+        if result is None:
+            return
+
+        # Store result for next phase
+        if phase_name == "brief":
+            brief_result = result
+            findings_count = len(brief_result.get("findings", []))
+            yield {
+                "event": "agent_complete",
+                "agent": "brief",
+                "message": f"Brief finalized — {findings_count} findings, confidence: {brief_result.get('confidence', '?')} ({elapsed()}s)",
+            }
+        elif phase_name == "architect":
+            outline_result = result
+            slide_count = len(outline_result.get("slides", []))
+            yield {
+                "event": "agent_complete",
+                "agent": "architect",
+                "message": f"Outline finalized — {slide_count} slides with {narrative.upper()} arc ({elapsed()}s)",
+            }
+        elif phase_name == "writer":
+            content_result = result
+            yield {
+                "event": "agent_complete",
+                "agent": "writer",
+                "message": f"Content finalized — {len(content_result.get('slides', []))} slides written ({elapsed()}s)",
+            }
+
+    # ===== PHASE 5: REVIEWER — Final Quality Gate (with heartbeats) =====
     yield {
         "event": "agent_start",
         "agent": "reviewer",
         "message": "Senior Partner reviewing all slides — scoring and rewriting weak ones...",
     }
+
+    review = content_result
     try:
-        review = await reviewer_agent.run(content, brief)
+        async for event in _run_with_heartbeat(
+            lambda: reviewer_agent.run(content_result, brief_result),
+            "reviewer",
+            pipeline_start,
+        ):
+            if "_result" in event:
+                review = event["_result"]
+            else:
+                yield event  # heartbeat
+
         rewritten = review.get("slides_rewritten", 0)
         overall = review.get("overall_score", "?")
         yield {
@@ -208,17 +258,17 @@ async def run_pipeline(
         }
     except Exception as e:
         yield {"event": "agent_error", "agent": "reviewer", "message": str(e)}
-        review = content
+        review = content_result
         review["overall_score"] = "N/A"
 
     total_elapsed = round(time.time() - pipeline_start, 1)
 
     final_plan = {
         "title": topic,
-        "story_spine": outline.get("story_spine", ""),
+        "story_spine": outline_result.get("story_spine", ""),
         "overall_score": review.get("overall_score", "?"),
         "narrative_coherence": review.get("narrative_coherence", ""),
-        "slides": review.get("slides", content.get("slides", [])),
+        "slides": review.get("slides", content_result.get("slides", [])),
         "counterarguments_addressed": review.get("counterarguments_addressed", False),
         "actionable_ask_present": review.get("actionable_ask_present", False),
         "weakest_dimension": review.get("weakest_dimension", ""),
