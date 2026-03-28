@@ -262,35 +262,9 @@ async def generate(request: Request):
             yield f"data: {json.dumps({'event': 'error', 'message': 'Pipeline failed to produce a deck plan'})}\n\n"
             return
 
-        # Gamma design phase
-        yield f"data: {json.dumps({'event': 'agent_start', 'agent': 'gamma', 'message': 'Gamma Design Engine: Creating professional slides...'})}\n\n"
-
-        try:
-            gamma_result = await generate_via_gamma(deck_plan, req.theme)
-
-            if gamma_result.get("error"):
-                yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': gamma_result['error']})}\n\n"
-
-                # Fallback to python-pptx
-                yield f"data: {json.dumps({'event': 'agent_start', 'agent': 'pptx_fallback', 'message': 'Falling back to python-pptx generation...'})}\n\n"
-                try:
-                    from deck_builder import build_deck
-                    job_id = str(uuid.uuid4())
-                    output_path = os.path.join(TMPDIR, f"{job_id}.pptx")
-                    build_deck(deck_plan, output_path, req.theme)
-                    JOBS[job_id] = output_path
-                    yield f"data: {json.dumps({'event': 'complete', 'job_id': job_id, 'gamma_url': None})}\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({'event': 'error', 'message': f'Fallback also failed: {str(e)}'})}\n\n"
-            else:
-                job_id = str(uuid.uuid4())
-                if gamma_result.get("file_path"):
-                    JOBS[job_id] = gamma_result["file_path"]
-                yield f"data: {json.dumps({'event': 'agent_complete', 'agent': 'gamma', 'message': 'Gamma design complete'})}\n\n"
-                yield f"data: {json.dumps({'event': 'complete', 'job_id': job_id, 'gamma_url': gamma_result.get('gamma_url')})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'event': 'error', 'message': f'Gamma error: {str(e)}'})}\n\n"
+        # Format deck content for Gamma paste
+        gamma_text = await format_deck_for_gamma(deck_plan)
+        yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text, 'deck_plan': deck_plan})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -378,10 +352,15 @@ HTML_PAGE = """<!DOCTYPE html>
   .result { display:none; background:var(--surface); border:1px solid var(--border);
     border-radius:12px; padding:1.5rem; text-align:center; }
   .result.active { display:block; }
-  .dl-btn { display:inline-block; background:linear-gradient(135deg,var(--accent),var(--green));
+  .dl-btn, .copy-btn { display:inline-block; background:linear-gradient(135deg,var(--accent),var(--green));
     color:#fff; padding:0.75rem 2rem; border-radius:8px; font-weight:600; text-decoration:none;
-    margin-top:1rem; }
-  .gamma-link { display:block; margin-top:0.75rem; color:var(--accent); font-size:0.85rem; }
+    margin-top:1rem; cursor:pointer; border:none; font-size:0.95rem; }
+  .copy-btn:hover { opacity:0.85; }
+  .gamma-content { width:100%; min-height:300px; max-height:500px; background:var(--bg); color:var(--text);
+    border:1px solid var(--border); border-radius:8px; padding:1rem; font-family:monospace;
+    font-size:0.8rem; resize:vertical; margin-top:1rem; white-space:pre-wrap; }
+  .result-header { color:var(--green); margin-bottom:0.5rem; }
+  .result-hint { color:var(--text-dim); font-size:0.8rem; margin-top:0.5rem; }
 </style>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
@@ -598,9 +577,11 @@ function handleEvent(e) {
     case 'complete': {
       const r = document.getElementById('result');
       r.classList.add('active');
-      let html = '<h2 style="color:var(--green)">Deck Ready</h2>';
-      if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+e.job_id+'">Download PPTX</a>';
-      if (e.gamma_url) html += '<a class="gamma-link" href="'+e.gamma_url+'" target="_blank">Edit in Gamma →</a>';
+      let html = '<h2 class="result-header">Deck Ready — Copy to Gamma</h2>';
+      html += '<p class="result-hint">Paste this into Gamma\'s "Import document" or "Paste content" to generate your slides.</p>';
+      html += '<textarea class="gamma-content" id="gammaContent" readonly>'+esc(e.gamma_content || '')+'</textarea>';
+      html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
+      html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;">Copied!</span>';
       r.innerHTML = html;
       break;
     }
@@ -611,6 +592,16 @@ function handleEvent(e) {
 }
 
 function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+function copyGamma() {
+  const ta = document.getElementById('gammaContent');
+  ta.select();
+  navigator.clipboard.writeText(ta.value).then(() => {
+    const msg = document.getElementById('copyMsg');
+    msg.style.display = 'inline';
+    setTimeout(() => msg.style.display = 'none', 2000);
+  });
+}
 </script>
 </body>
 </html>
