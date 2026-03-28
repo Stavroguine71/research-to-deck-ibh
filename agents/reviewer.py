@@ -77,8 +77,9 @@ Score every slide. Rewrite anything below 4/5 on any dimension."""
         result = await call_claude(
             system_prompt=self.SYSTEM_PROMPT,
             user_message=user_msg,
-            thinking_budget=12000,
-            max_tokens=20000,
+            model="claude-sonnet-4-20250514",
+            thinking_budget=5000,
+            max_tokens=16000,
         )
 
         review = parse_json_response(result["text"])
