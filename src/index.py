@@ -750,10 +750,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </header>
 
 <main class="container" style="padding-top:0;">
-  <form class="form-card" id="formCard" onsubmit="event.preventDefault(); generate();">
+  <form class="form-card" id="formCard">
     <h2 style="font-size:1rem;color:var(--text);margin-bottom:0.75rem;">Configure Your Deck</h2>
     <label for="topic">Research Topic</label>
-    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError topicCounter" maxlength="500" placeholder="e.g. The future of AI agents in enterprise software" oninput="updateTopicCounter()">
+    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError topicCounter" maxlength="500" placeholder="e.g. The future of AI agents in enterprise software">
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
       <span id="topicCounter" style="font-size:0.7rem;color:var(--text-dim);">0/500</span>
@@ -767,7 +767,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="report">Report</option><option value="pitch">Pitch</option>
         </select></div>
       <div><label for="numSlides">Slides</label>
-        <input type="number" id="numSlides" value="10" min="5" max="25" onblur="clampSlides()"></div>
+        <input type="number" id="numSlides" value="10" min="5" max="25"></div>
     </div>
 
     <div class="row">
@@ -788,7 +788,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </select></div>
     </div>
 
-    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="audienceDetail" data-label="Audience Detail" onclick="toggleSection(this,'audienceDetail')">+ Audience Detail</button>
+    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="audienceDetail" data-label="Audience Detail">+ Audience Detail</button>
     <div class="collapse-content" id="audienceDetail">
       <div class="row">
         <div><label for="audienceRole">Role</label><input type="text" id="audienceRole" maxlength="200" placeholder="e.g. VP Engineering"></div>
@@ -803,7 +803,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <label for="desiredAction">Desired Action</label><input type="text" id="desiredAction" maxlength="300" placeholder="What should they do after?">
     </div>
 
-    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="narrativeDetail" data-label="Narrative & Tone" onclick="toggleSection(this,'narrativeDetail')">+ Narrative & Tone</button>
+    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="narrativeDetail" data-label="Narrative & Tone">+ Narrative & Tone</button>
     <div class="collapse-content" id="narrativeDetail">
       <div class="row3">
         <div><label for="narrative">Narrative Arc</label>
@@ -832,7 +832,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <button type="submit" class="btn" id="genBtn">Generate Deck</button>
-    <button type="button" class="btn" id="cancelBtn" style="display:none;background:var(--red);margin-top:0.5rem;" onclick="cancelGeneration()">Cancel</button>
+    <button type="button" class="btn" id="cancelBtn" style="display:none;background:var(--red);margin-top:0.5rem;">Cancel</button>
   </form>
 
   <div class="pipeline" id="pipeline" role="region" aria-label="Pipeline progress">
@@ -1034,11 +1034,11 @@ async function generate() {
       var errMsg = e.message || 'Network error';
       var recoveryBtn = '';
       if (errMsg.indexOf('401') !== -1) {
-        recoveryBtn = '<button class="btn" style="margin-top:1rem;" onclick="location.reload()">Reload Page</button>';
+        recoveryBtn = '<button class="btn" style="margin-top:1rem;" data-action="reload">Reload Page</button>';
       } else if (errMsg.indexOf('429') !== -1) {
         recoveryBtn = '<p style="color:var(--yellow);margin-top:0.5rem;" id="retryCountdown">Please wait...</p>';
       } else {
-        recoveryBtn = '<button class="btn" style="margin-top:1rem;" onclick="generate()">Try Again</button>';
+        recoveryBtn = '<button class="btn" style="margin-top:1rem;" data-action="generate">Try Again</button>';
       }
       result.innerHTML = '<p style="color:var(--red)">'+esc(errMsg)+'</p>' + recoveryBtn;
       if (errMsg.indexOf('429') !== -1) startRetryCountdown();
@@ -1147,14 +1147,14 @@ function handleEvent(e) {
         if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         html += '<p class="result-hint">Copy and paste into Gamma to generate your slides.</p>';
         html += '<textarea class="gamma-content" id="gammaContent" readonly aria-label="Deck content for Gamma">'+esc(e.gamma_content)+'</textarea>';
-        html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
+        html += '<button class="copy-btn" data-action="copyGamma">Copy to Clipboard</button>';
         html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;" role="status">Copied!</span>';
       } else {
         html += '<h2 class="result-header">Deck Ready</h2>';
         if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx">Download PPTX</a>';
       }
-      html += '<div style="margin-top:1.5rem;"><button class="btn" style="background:var(--surface2);border:1px solid var(--border);" onclick="resetForm()">Generate Another Deck</button></div>';
+      html += '<div style="margin-top:1.5rem;"><button class="btn" style="background:var(--surface2);border:1px solid var(--border);" data-action="resetForm">Generate Another Deck</button></div>';
       r.innerHTML = html;
       break;
     }
@@ -1203,7 +1203,7 @@ function startRetryCountdown() {
     seconds--;
     if (seconds <= 0) {
       clearInterval(iv);
-      el.innerHTML = '<button class="btn" onclick="generate()">Try Again</button>';
+      el.innerHTML = '<button class="btn" data-action="generate">Try Again</button>';
     } else {
       el.textContent = 'Rate limited. Retry in ' + seconds + 's...';
     }
@@ -1241,6 +1241,27 @@ function showSlideClampMsg(msg) {
 
 window.addEventListener('beforeunload', function(e) {
   if (isGenerating) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// CSP-compatible event binding — no inline handlers needed
+document.getElementById('formCard').addEventListener('submit', function(e) { e.preventDefault(); generate(); });
+document.getElementById('topic').addEventListener('input', updateTopicCounter);
+document.getElementById('numSlides').addEventListener('blur', clampSlides);
+document.querySelectorAll('.collapse-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() { toggleSection(this, this.getAttribute('aria-controls')); });
+});
+document.getElementById('cancelBtn').addEventListener('click', cancelGeneration);
+
+// Event delegation for dynamically created buttons (data-action attribute)
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (!t.dataset || !t.dataset.action) return;
+  switch(t.dataset.action) {
+    case 'copyGamma': copyGamma(); break;
+    case 'resetForm': resetForm(); break;
+    case 'generate': generate(); break;
+    case 'reload': location.reload(); break;
+  }
 });
 </script>
 </body>

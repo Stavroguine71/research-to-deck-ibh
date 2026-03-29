@@ -115,7 +115,7 @@ async def run_pipeline(
         }
     except Exception as e:
         logger.exception("Researcher agent failed")
-        yield {"event": "agent_error", "agent": "researcher", "message": f"Research failed ({type(e).__name__}). Check API keys."}
+        yield {"event": "agent_error", "agent": "researcher", "message": "Research failed. Check API keys."}
         yield {"event": "error", "message": "Research agent failed. Please try again."}
         return
 
@@ -280,7 +280,7 @@ async def run_pipeline(
         }
     except Exception as e:
         logger.exception("Reviewer agent failed")
-        yield {"event": "agent_error", "agent": "reviewer", "message": f"Reviewer error: {type(e).__name__}. Using unreviewed content."}
+        yield {"event": "agent_error", "agent": "reviewer", "message": "Reviewer encountered an error. Using unreviewed content."}
         review = {
             **content_result,
             "overall_score": "N/A",
