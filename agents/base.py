@@ -123,21 +123,34 @@ def parse_json_response(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Second try: extract the largest JSON object from the text
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    # Second try: iterative search for valid JSON objects starting at each '{'
+    for i, ch in enumerate(cleaned):
+        if ch == '{':
+            try:
+                result = json.loads(cleaned[i:])
+                return result
+            except json.JSONDecodeError:
+                # Try finding the matching closing brace via decoder
+                decoder = json.JSONDecoder()
+                try:
+                    obj, _ = decoder.raw_decode(cleaned, i)
+                    return obj
+                except json.JSONDecodeError:
+                    continue
 
     # Third try: extract JSON array
-    match = re.search(r"\[.*\]", cleaned, re.DOTALL)
-    if match:
-        try:
-            return {"slides": json.loads(match.group())}
-        except json.JSONDecodeError:
-            pass
+    for i, ch in enumerate(cleaned):
+        if ch == '[':
+            try:
+                arr = json.loads(cleaned[i:])
+                return {"slides": arr}
+            except json.JSONDecodeError:
+                decoder = json.JSONDecoder()
+                try:
+                    arr, _ = decoder.raw_decode(cleaned, i)
+                    return {"slides": arr}
+                except json.JSONDecodeError:
+                    continue
 
     raise ValueError(
         f"Could not parse JSON from Claude response (first 200 chars): {text[:200]}"

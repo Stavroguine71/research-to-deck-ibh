@@ -43,37 +43,38 @@ async def _run_with_heartbeat(agent_fn, agent_name: str, pipeline_start: float):
     SSE connection alive.
 
     Final yield is {"_result": <agent output>} or raises on error.
+    Properly cancels the task if the generator is closed (client disconnect).
     """
-    result_holder = {"value": None, "error": None, "done": False}
+    task = asyncio.create_task(agent_fn())
 
-    async def _work():
-        try:
-            result_holder["value"] = await agent_fn()
-        except Exception as e:
-            result_holder["error"] = e
-        finally:
-            result_holder["done"] = True
+    try:
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
+            except asyncio.TimeoutError:
+                elapsed = round(time.time() - pipeline_start, 1)
+                yield {
+                    "event": "heartbeat",
+                    "agent": agent_name,
+                    "message": f"{agent_name.title()} still working... ({elapsed}s)",
+                }
 
-    task = asyncio.create_task(_work())
-
-    while not result_holder["done"]:
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
-        except asyncio.TimeoutError:
-            elapsed = round(time.time() - pipeline_start, 1)
-            yield {
-                "event": "heartbeat",
-                "agent": agent_name,
-                "message": f"{agent_name.title()} still working... ({elapsed}s)",
-            }
-
-    # Make sure the task is truly done
-    await task
-
-    if result_holder["error"]:
-        raise result_holder["error"]
-
-    yield {"_result": result_holder["value"]}
+        # Task is done — check for exceptions
+        result = task.result()
+        yield {"_result": result}
+    except GeneratorExit:
+        # Client disconnected — cancel the running task
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+        raise
 
 
 async def run_pipeline(
@@ -93,6 +94,9 @@ async def run_pipeline(
     def elapsed():
         return round(time.time() - pipeline_start, 1)
 
+    # Sanitize topic for use in LLM prompts
+    safe_topic = f"<user_input>{topic}</user_input>"
+
     # ===== PHASE 1: PARALLEL RESEARCH =====
     yield {
         "event": "agent_start",
@@ -100,7 +104,7 @@ async def run_pipeline(
         "message": "Research Agent: Running 4 search queries in parallel...",
     }
     try:
-        research_data = await researcher.run(topic)
+        research_data = await researcher.run(topic)  # Raw topic for search queries
         yield {
             "event": "agent_complete",
             "agent": "researcher",
@@ -110,6 +114,9 @@ async def run_pipeline(
         yield {"event": "agent_error", "agent": "researcher", "message": "Research failed. Check API keys."}
         yield {"event": "error", "message": "Research agent failed. Please try again."}
         return
+
+    # Tag topic in research_data for downstream agents
+    research_data["topic"] = safe_topic
 
     # Check for empty research results
     if research_data.get("total_results", 0) == 0:
@@ -216,27 +223,10 @@ async def run_pipeline(
         # Store result for next phase
         if phase_name == "brief":
             brief_result = result
-            findings_count = len(brief_result.get("findings", []))
-            yield {
-                "event": "agent_complete",
-                "agent": "brief",
-                "message": f"Brief finalized — {findings_count} findings, confidence: {brief_result.get('confidence', '?')} ({elapsed()}s)",
-            }
         elif phase_name == "architect":
             outline_result = result
-            slide_count = len(outline_result.get("slides", []))
-            yield {
-                "event": "agent_complete",
-                "agent": "architect",
-                "message": f"Outline finalized — {slide_count} slides with {narrative.upper()} arc ({elapsed()}s)",
-            }
         elif phase_name == "writer":
             content_result = result
-            yield {
-                "event": "agent_complete",
-                "agent": "writer",
-                "message": f"Content finalized — {len(content_result.get('slides', []))} slides written ({elapsed()}s)",
-            }
 
     # ===== PHASE 5: REVIEWER — Final Quality Gate (with heartbeats) =====
     yield {
@@ -272,7 +262,7 @@ async def run_pipeline(
     total_elapsed = round(time.time() - pipeline_start, 1)
 
     final_plan = {
-        "title": topic,
+        "title": topic,  # Raw topic for display (not sent to LLM)
         "story_spine": outline_result.get("story_spine", ""),
         "overall_score": review.get("overall_score", "?"),
         "narrative_coherence": review.get("narrative_coherence", ""),

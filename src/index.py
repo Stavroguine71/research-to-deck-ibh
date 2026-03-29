@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,6 @@ async def security_headers(request: Request, call_next):
     return response
 
 
-GAMMA_API_KEY = os.environ.get("GAMMA_API_KEY", "")
 APP_API_KEY = os.environ.get("APP_API_KEY", "")
 TMPDIR = tempfile.mkdtemp()
 
@@ -87,7 +86,7 @@ RATE_LIMIT_WINDOW = 300  # 5 minutes
 async def startup():
     validate_required_keys()
     if not APP_API_KEY:
-        logger.warning("APP_API_KEY not set — API is unauthenticated! Set this env var to secure your endpoint.")
+        raise RuntimeError("APP_API_KEY must be set to secure the API. Set this env var before starting.")
     asyncio.create_task(cleanup_loop())
 
 
@@ -125,16 +124,16 @@ async def verify_api_key(x_api_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+MAX_RATE_ENTRIES = 10000
+
+
 def get_client_ip(request: Request) -> str:
-    """Handle X-Forwarded-For behind proxies."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Use direct TCP connection IP — never trust X-Forwarded-For to prevent spoofing."""
     return request.client.host if request.client else "unknown"
 
 
 def check_rate_limit(request: Request):
-    """In-memory rate limiter by IP."""
+    """In-memory rate limiter by IP. Returns remaining count for headers."""
     ip = get_client_ip(request)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW
@@ -145,10 +144,15 @@ def check_rate_limit(request: Request):
         RATE_LIMIT[ip] = []
 
     if len(RATE_LIMIT[ip]) >= RATE_LIMIT_MAX:
-        remaining = int(RATE_LIMIT_WINDOW - (now - RATE_LIMIT[ip][0]))
+        remaining = max(1, int(RATE_LIMIT_WINDOW - (now - RATE_LIMIT[ip][0])))
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {remaining} seconds.")
 
     RATE_LIMIT[ip].append(now)
+
+    # Evict oldest entries if dict grows too large (DoS protection)
+    if len(RATE_LIMIT) > MAX_RATE_ENTRIES:
+        oldest_ip = min(RATE_LIMIT, key=lambda k: RATE_LIMIT[k][0] if RATE_LIMIT[k] else 0)
+        del RATE_LIMIT[oldest_ip]
 
 
 # ============================================================
@@ -157,18 +161,18 @@ def check_rate_limit(request: Request):
 
 class DeckRequest(BaseModel):
     topic: str = Field(..., max_length=500)
-    purpose: str = "inform"
+    purpose: Literal["inform", "persuade", "sell", "educate", "report", "pitch"] = "inform"
     num_slides: int = Field(default=10, ge=5, le=25)
-    audience: str = "general_business"
-    theme: str = "professional"
+    audience: Literal["general_business", "c_suite", "senior_management", "external_peers", "investors", "regulators"] = "general_business"
+    theme: Literal["professional", "minimal", "bold"] = "professional"
     audience_role: Optional[str] = Field(default="", max_length=200)
-    audience_familiarity: Optional[str] = "some"
+    audience_familiarity: Optional[Literal["none", "some", "expert"]] = "some"
     audience_motivation: Optional[str] = Field(default="", max_length=300)
     audience_objections: Optional[str] = Field(default="", max_length=300)
     desired_action: Optional[str] = Field(default="", max_length=300)
-    narrative: Optional[str] = "pir"
-    tone: Optional[str] = "authoritative"
-    depth: Optional[str] = "standard"
+    narrative: Optional[Literal["pir", "scqa", "change"]] = "pir"
+    tone: Optional[Literal["authoritative", "collaborative", "provocative", "neutral", "inspirational"]] = "authoritative"
+    depth: Optional[Literal["overview", "standard", "deep"]] = "standard"
     style: Optional[str] = ""
     constraints: Optional[str] = ""
 
@@ -276,8 +280,9 @@ async def format_deck_for_gamma(deck_plan: dict) -> str:
 
 async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> dict:
     """Send deck plan to Gamma API for professional design + PPTX export."""
-    if not GAMMA_API_KEY:
-        return {"error": "No GAMMA_API_KEY set", "gamma_url": None, "file_path": None}
+    gamma_key = os.environ.get("GAMMA_API_KEY", "")
+    if not gamma_key:
+        return {"error": "GAMMA_API_KEY not configured", "gamma_url": None, "file_path": None}
 
     input_text = await format_deck_for_gamma(deck_plan)
     tone_map = {
@@ -290,7 +295,7 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         resp = await client.post(
             "https://public-api.gamma.app/v1.0/generations",
             headers={
-                "X-API-KEY": GAMMA_API_KEY,
+                "X-API-KEY": gamma_key,
                 "Content-Type": "application/json",
             },
             json={
@@ -311,13 +316,12 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         if not gen_id:
             return {"error": "Gamma returned no generation ID", "gamma_url": None, "file_path": None}
 
-        import asyncio
         for _ in range(40):
             await asyncio.sleep(3)
             try:
                 status_resp = await client.get(
                     f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
-                    headers={"X-API-KEY": GAMMA_API_KEY},
+                    headers={"X-API-KEY": gamma_key},
                 )
                 status_resp.raise_for_status()
                 status = status_resp.json()
@@ -331,6 +335,11 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
 
                 file_path = None
                 if download_url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(download_url)
+                    ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
+                    if parsed.hostname not in ALLOWED_HOSTS:
+                        return {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
                     dl = await client.get(download_url)
                     dl.raise_for_status()
                     file_path = os.path.join(TMPDIR, f"{gen_id}.pptx")
@@ -355,7 +364,8 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTML_PAGE
+    # Inject API key into HTML so the frontend can authenticate requests
+    return HTML_PAGE.replace("{{APP_API_KEY}}", APP_API_KEY)
 
 
 @app.post("/api/generate")
@@ -390,7 +400,7 @@ async def generate(request: Request, _=Depends(verify_api_key)):
         gamma_text = await format_deck_for_gamma(deck_plan)
 
         # Try Gamma API
-        if GAMMA_API_KEY:
+        if os.environ.get("GAMMA_API_KEY", ""):
             yield f"data: {json.dumps({'event': 'agent_start', 'agent': 'gamma', 'message': 'Gamma Design Engine: Creating professional slides...'})}\n\n"
             try:
                 gamma_result = await generate_via_gamma(deck_plan, req.theme)
@@ -450,7 +460,7 @@ async def download(job_id: str, request: Request, _=Depends(verify_api_key)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agents": 6, "gamma": bool(GAMMA_API_KEY)}
+    return {"status": "ok"}
 
 
 # ============================================================
@@ -462,6 +472,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="api-key" content="{{APP_API_KEY}}">
 <title>Multi-Agent Research-to-Deck</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
 <style>
@@ -510,10 +521,13 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius:12px; padding:1.25rem; margin-bottom:1.5rem; }
   .pipeline.active { display:block; }
   .pipeline h2 { font-size:0.9rem; color:var(--text-dim); margin-bottom:0.75rem; }
+  #agentLog { max-height:400px; overflow-y:auto; }
+  .elapsed-timer { color:var(--text-dim); font-size:0.8rem; float:right; }
   .agent-row { display:flex; align-items:center; gap:0.6rem; padding:0.4rem 0;
     border-bottom:1px solid var(--border); font-size:0.82rem; }
   .agent-row:last-child { border-bottom:none; }
-  .agent-dot { width:8px; height:8px; border-radius:50%; background:var(--border); flex-shrink:0; }
+  .agent-dot { width:18px; height:18px; border-radius:50%; background:var(--border); flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; font-size:0.65rem; color:#fff; }
   .agent-dot.running { background:var(--accent); animation:pulse 1s infinite; }
   .agent-dot.done { background:var(--green); }
   .agent-dot.error { background:var(--red); }
@@ -575,7 +589,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <form class="form-card" id="formCard" onsubmit="event.preventDefault(); generate();">
     <h2 style="font-size:1rem;color:var(--text);margin-bottom:0.75rem;">Configure Your Deck</h2>
     <label for="topic">Research Topic</label>
-    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError" placeholder="e.g. The future of AI agents in enterprise software">
+    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError" maxlength="500" placeholder="e.g. The future of AI agents in enterprise software">
     <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
 
     <div class="row">
@@ -610,16 +624,16 @@ HTML_PAGE = """<!DOCTYPE html>
     <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="audienceDetail" data-label="Audience Detail" onclick="toggleSection(this,'audienceDetail')">+ Audience Detail</button>
     <div class="collapse-content" id="audienceDetail">
       <div class="row">
-        <div><label for="audienceRole">Role</label><input type="text" id="audienceRole" placeholder="e.g. VP Engineering"></div>
+        <div><label for="audienceRole">Role</label><input type="text" id="audienceRole" maxlength="200" placeholder="e.g. VP Engineering"></div>
         <div><label for="audienceFamiliarity">Familiarity</label>
           <select id="audienceFamiliarity">
             <option value="none">None</option><option value="some" selected>Some</option>
             <option value="expert">Expert</option>
           </select></div>
       </div>
-      <label for="audienceMotivation">Motivation</label><input type="text" id="audienceMotivation" placeholder="What brought them to this meeting?">
-      <label for="audienceObjections">Likely Objections</label><input type="text" id="audienceObjections" placeholder="What will they push back on?">
-      <label for="desiredAction">Desired Action</label><input type="text" id="desiredAction" placeholder="What should they do after?">
+      <label for="audienceMotivation">Motivation</label><input type="text" id="audienceMotivation" maxlength="300" placeholder="What brought them to this meeting?">
+      <label for="audienceObjections">Likely Objections</label><input type="text" id="audienceObjections" maxlength="300" placeholder="What will they push back on?">
+      <label for="desiredAction">Desired Action</label><input type="text" id="desiredAction" maxlength="300" placeholder="What should they do after?">
     </div>
 
     <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="narrativeDetail" data-label="Narrative & Tone" onclick="toggleSection(this,'narrativeDetail')">+ Narrative & Tone</button>
@@ -663,7 +677,8 @@ HTML_PAGE = """<!DOCTYPE html>
       <span class="step" id="step-reviewer">Review</span>
       <span class="step" id="step-gamma">Design</span>
     </div>
-    <h2>Agent Pipeline</h2>
+    <h2>Agent Pipeline <span class="elapsed-timer" id="elapsedTimer"></span></h2>
+    <p id="progressLabel" style="font-size:0.8rem;color:var(--text-dim);margin-bottom:0.5rem;"></p>
     <div id="agentLog" role="log" aria-live="polite" aria-label="Agent status updates"></div>
     <div id="statusAnnounce" role="status" class="sr-only" aria-live="polite"></div>
   </div>
@@ -680,13 +695,18 @@ function toggleSection(btn, id) {
   btn.textContent = (isOpen ? '- ' : '+ ') + btn.dataset.label;
 }
 
+function statusIcon(s) {
+  var icons = {done:'\\u2713', error:'\\u2717', running:'\\u27F3', rejected:'\\u26A0', validated:'\\u2713'};
+  return icons[s] || '\\u25CF';
+}
+
 function addAgentRow(agent, msg, status) {
   var log = document.getElementById('agentLog');
   var id = 'row-' + agent + '-' + Date.now();
   var row = document.createElement('div');
   row.className = 'agent-row';
   row.id = id;
-  row.innerHTML = '<div class="agent-dot '+status+'" aria-hidden="true"></div><span class="agent-label">'+esc(agent)+'</span><span class="agent-msg">'+esc(msg)+'</span>';
+  row.innerHTML = '<div class="agent-dot '+status+'" aria-hidden="true">'+statusIcon(status)+'</div><span class="sr-only">'+esc(status)+'</span><span class="agent-label">'+esc(agent)+'</span><span class="agent-msg">'+esc(msg)+'</span>';
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;
   return id;
@@ -696,11 +716,38 @@ function updateLastRow(status, msg) {
   var rows = document.querySelectorAll('.agent-row');
   if (!rows.length) return;
   var last = rows[rows.length - 1];
-  last.querySelector('.agent-dot').className = 'agent-dot ' + status;
+  var dot = last.querySelector('.agent-dot');
+  dot.className = 'agent-dot ' + status;
+  dot.textContent = statusIcon(status);
   if (msg) last.querySelector('.agent-msg').textContent = msg;
 }
 
 var controller;
+var elapsedInterval;
+var stepCount = 0;
+var TOTAL_STEPS = 6;
+
+function startTimer() {
+  var start = Date.now();
+  var el = document.getElementById('elapsedTimer');
+  elapsedInterval = setInterval(function() {
+    var s = Math.floor((Date.now() - start) / 1000);
+    el.textContent = Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+  }, 1000);
+}
+
+function stopTimer() {
+  if (elapsedInterval) clearInterval(elapsedInterval);
+  elapsedInterval = null;
+}
+
+function updateProgressLabel(agentName) {
+  stepCount++;
+  var el = document.getElementById('progressLabel');
+  if (el) el.textContent = 'Step ' + stepCount + ' of ' + TOTAL_STEPS + ': ' + agentName;
+}
+
+var apiKey = '';
 
 async function generate() {
   var topicEl = document.getElementById('topic');
@@ -716,6 +763,11 @@ async function generate() {
   errEl.style.display = 'none';
   topicEl.removeAttribute('aria-invalid');
 
+  if (!apiKey) {
+    var meta = document.querySelector('meta[name="api-key"]');
+    apiKey = meta ? meta.content : '';
+  }
+
   var btn = document.getElementById('genBtn');
   var pipeline = document.getElementById('pipeline');
   var result = document.getElementById('result');
@@ -727,7 +779,13 @@ async function generate() {
   pipeline.classList.add('active');
   result.classList.remove('active'); result.innerHTML = '';
   document.getElementById('agentLog').innerHTML = '';
+  document.getElementById('elapsedTimer').textContent = '';
+  document.getElementById('progressLabel').textContent = '';
+  stepCount = 0;
   resetSteps();
+  startTimer();
+
+  addAgentRow('system', 'Connecting to pipeline...', 'running');
 
   var body = {
     topic: topic,
@@ -749,7 +807,7 @@ async function generate() {
   try {
     var res = await fetch('/api/generate', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: {'Content-Type':'application/json', 'X-API-Key': apiKey},
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -758,6 +816,8 @@ async function generate() {
       var errData = await res.json().catch(function() { return {}; });
       throw new Error(errData.detail || 'Server error ' + res.status);
     }
+
+    updateLastRow('done', 'Connected');
 
     var reader = res.body.getReader();
     var decoder = new TextDecoder();
@@ -774,12 +834,20 @@ async function generate() {
         try { handleEvent(JSON.parse(lines[i].slice(6))); } catch(e) {}
       }
     }
+    // Process any remaining data in the buffer after stream ends
+    if (buffer.trim()) {
+      var remaining = buffer.trim();
+      if (remaining.startsWith('data: ')) {
+        try { handleEvent(JSON.parse(remaining.slice(6))); } catch(e) {}
+      }
+    }
   } catch(e) {
     if (e.name !== 'AbortError') {
       result.classList.add('active');
       result.innerHTML = '<p style="color:var(--red)">'+esc(e.message || 'Network error')+'</p>';
     }
   }
+  stopTimer();
   btn.disabled = false; btn.textContent = 'Generate Deck';
   document.getElementById('cancelBtn').style.display = 'none';
   controller = null;
@@ -787,6 +855,7 @@ async function generate() {
 
 function cancelGeneration() {
   if (controller) controller.abort();
+  stopTimer();
   document.getElementById('cancelBtn').style.display = 'none';
   var btn = document.getElementById('genBtn');
   btn.disabled = false;
@@ -831,6 +900,7 @@ function handleEvent(e) {
     case 'agent_start':
       addAgentRow(e.agent || 'system', e.message, 'running');
       setStepActive(e.agent);
+      updateProgressLabel(e.agent || 'system');
       announce(e.message);
       break;
     case 'agent_complete':

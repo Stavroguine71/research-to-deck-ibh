@@ -10,16 +10,17 @@ import asyncio
 import os
 import httpx
 
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-
-
 async def _tavily_search(query: str, max_results: int = 5) -> dict:
-    """Single Tavily API call."""
+    """Single Tavily API call. Reads key at call time to support late-binding."""
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    if not api_key:
+        return {"results": []}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "api_key": TAVILY_API_KEY,
+                "api_key": api_key,
                 "query": query,
                 "search_depth": "advanced",
                 "max_results": max_results,
