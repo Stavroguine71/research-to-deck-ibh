@@ -6,12 +6,15 @@ Gamma integration for design + PPTX export.
 """
 
 import os
+import re
 import sys
 import json
 import uuid
 import time
 import asyncio
 import secrets
+import socket
+import ipaddress
 import httpx
 import tempfile
 import logging
@@ -70,7 +73,7 @@ async def security_headers(request: Request, call_next):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self'; "
-            "style-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
             "frame-ancestors 'none'"
         )
     return response
@@ -162,10 +165,11 @@ MAX_RATE_ENTRIES = 10000
 
 
 def get_client_ip(request: Request) -> str:
-    """Trust X-Forwarded-For from Railway's reverse proxy (leftmost = real client)."""
+    """Use rightmost X-Forwarded-For IP (proxy-appended, not spoofable by client)."""
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        # Rightmost entry is appended by the nearest trusted proxy (Railway)
+        return forwarded.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -186,10 +190,12 @@ def check_rate_limit(request: Request):
 
     RATE_LIMIT[ip].append(now)
 
-    # Evict oldest entries if dict grows too large (DoS protection)
+    # Bulk evict oldest 10% of entries if dict grows too large (DoS protection)
     if len(RATE_LIMIT) > MAX_RATE_ENTRIES:
-        oldest_ip = min(RATE_LIMIT, key=lambda k: RATE_LIMIT[k][0] if RATE_LIMIT[k] else 0)
-        del RATE_LIMIT[oldest_ip]
+        sorted_ips = sorted(RATE_LIMIT.items(), key=lambda kv: kv[1][0] if kv[1] else 0)
+        evict_count = max(1, len(sorted_ips) // 10)
+        for ip_key, _ in sorted_ips[:evict_count]:
+            RATE_LIMIT.pop(ip_key, None)
 
 
 # ============================================================
@@ -197,7 +203,7 @@ def check_rate_limit(request: Request):
 # ============================================================
 
 class DeckRequest(BaseModel):
-    topic: str = Field(..., max_length=500)
+    topic: str = Field(..., min_length=3, max_length=500)
     purpose: Literal["inform", "persuade", "sell", "educate", "report", "pitch"] = "inform"
     num_slides: int = Field(default=10, ge=5, le=25)
     audience: Literal["general_business", "c_suite", "senior_management", "external_peers", "investors", "regulators"] = "general_business"
@@ -328,7 +334,7 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         "bold": "bold",
     }
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=60.0)) as client:
         resp = await client.post(
             "https://public-api.gamma.app/v1.0/generations",
             headers={
@@ -377,9 +383,18 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                     ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
                     if parsed.hostname not in ALLOWED_HOSTS:
                         return {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
+                    # DNS rebinding protection: resolve hostname and reject private IPs
+                    try:
+                        resolved_ip = socket.getaddrinfo(parsed.hostname, None)[0][4][0]
+                        if ipaddress.ip_address(resolved_ip).is_private:
+                            return {"error": "Download URL resolves to private IP", "gamma_url": None, "file_path": None}
+                    except (socket.gaierror, ValueError):
+                        return {"error": "Could not resolve download URL", "gamma_url": None, "file_path": None}
                     dl = await client.get(download_url)
                     dl.raise_for_status()
-                    file_path = os.path.join(TMPDIR, f"{gen_id}.pptx")
+                    # Use a local UUID for the filename — never trust gen_id from API
+                    safe_filename = str(uuid.uuid4())
+                    file_path = os.path.join(TMPDIR, f"{safe_filename}.pptx")
                     with open(file_path, "wb") as f:
                         f.write(dl.content)
 
@@ -399,14 +414,33 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
 # Routes
 # ============================================================
 
+SESSION_RATE_LIMIT: dict = {}  # ip -> [timestamps]
+SESSION_RATE_MAX = 10  # max page loads per window
+SESSION_RATE_WINDOW = 60  # 1 minute
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    # Rate-limit session creation to prevent flooding
+    ip = get_client_ip(request)
+    now = time.time()
+    window_start = now - SESSION_RATE_WINDOW
+    if ip in SESSION_RATE_LIMIT:
+        SESSION_RATE_LIMIT[ip] = [t for t in SESSION_RATE_LIMIT[ip] if t > window_start]
+    else:
+        SESSION_RATE_LIMIT[ip] = []
+    if len(SESSION_RATE_LIMIT[ip]) >= SESSION_RATE_MAX:
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
+    SESSION_RATE_LIMIT[ip].append(now)
+
     session_id = secrets.token_urlsafe(32)
     SESSIONS[session_id] = time.time()
-    # Evict oldest sessions if too many
+    # Bulk evict oldest 10% of sessions if too many
     if len(SESSIONS) > MAX_SESSIONS:
-        oldest = min(SESSIONS, key=SESSIONS.get)
-        del SESSIONS[oldest]
+        sorted_sessions = sorted(SESSIONS.items(), key=lambda x: x[1])
+        evict_count = max(1, len(sorted_sessions) // 10)
+        for sid, _ in sorted_sessions[:evict_count]:
+            SESSIONS.pop(sid, None)
     # Generate nonce for CSP
     nonce = secrets.token_urlsafe(16)
     request.state.csp_nonce = nonce
@@ -414,7 +448,7 @@ async def home(request: Request):
     response = HTMLResponse(html)
     response.set_cookie(
         "session", session_id,
-        httponly=True, samesite="strict", max_age=MAX_JOB_AGE,
+        httponly=True, samesite="strict", secure=True, max_age=MAX_JOB_AGE,
     )
     return response
 
@@ -429,8 +463,8 @@ async def generate(request: Request, _=Depends(verify_auth)):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     try:
         req = DeckRequest(**body)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid request. Check topic, num_slides (5-25), and field values.")
 
     check_rate_limit(request)
 
@@ -629,7 +663,9 @@ HTML_PAGE = """<!DOCTYPE html>
   .step.active { background:var(--accent); color:#fff; }
   .step.done { background:var(--green); color:#fff; }
   .progress-bar-wrap { height:4px; background:var(--surface2); border-radius:2px; margin-bottom:0.75rem; overflow:hidden; }
-  .progress-bar-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); transition:width 0.5s ease; width:0%; }
+  .progress-bar-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); transition:width 0.5s ease; width:0%;
+    background-size:200% 100%; animation:shimmer 1.5s ease-in-out infinite; }
+  @keyframes shimmer { 0% { background-position:200% 0; } 100% { background-position:-200% 0; } }
 
   @media (max-width:600px) {
     .row3 { grid-template-columns:1fr; }
@@ -658,8 +694,11 @@ HTML_PAGE = """<!DOCTYPE html>
   <form class="form-card" id="formCard" onsubmit="event.preventDefault(); generate();">
     <h2 style="font-size:1rem;color:var(--text);margin-bottom:0.75rem;">Configure Your Deck</h2>
     <label for="topic">Research Topic</label>
-    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError" maxlength="500" placeholder="e.g. The future of AI agents in enterprise software">
-    <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
+    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError topicCounter" maxlength="500" placeholder="e.g. The future of AI agents in enterprise software" oninput="updateTopicCounter()">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
+      <span id="topicCounter" style="font-size:0.7rem;color:var(--text-dim);">0/500</span>
+    </div>
 
     <div class="row">
       <div><label for="purpose">Purpose</label>
@@ -669,7 +708,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="report">Report</option><option value="pitch">Pitch</option>
         </select></div>
       <div><label for="numSlides">Slides</label>
-        <input type="number" id="numSlides" value="10" min="5" max="25"></div>
+        <input type="number" id="numSlides" value="10" min="5" max="25" onblur="clampSlides()"></div>
     </div>
 
     <div class="row">
@@ -815,6 +854,7 @@ var PHASE_PROGRESS = {researcher:16, brief:33, architect:50, writer:67, reviewer
 
 function updateProgressLabel(agentName) {
   stepCount++;
+  if (stepCount > TOTAL_STEPS) stepCount = TOTAL_STEPS;
   var el = document.getElementById('progressLabel');
   if (el) el.textContent = 'Step ' + stepCount + ' of ' + TOTAL_STEPS + ': ' + agentName;
   var pct = PHASE_PROGRESS[agentName] || 0;
@@ -915,7 +955,17 @@ async function generate() {
   } catch(e) {
     if (e.name !== 'AbortError') {
       result.classList.add('active');
-      result.innerHTML = '<p style="color:var(--red)">'+esc(e.message || 'Network error')+'</p>';
+      var errMsg = e.message || 'Network error';
+      var recoveryBtn = '';
+      if (errMsg.indexOf('401') !== -1) {
+        recoveryBtn = '<button class="btn" style="margin-top:1rem;" onclick="location.reload()">Reload Page</button>';
+      } else if (errMsg.indexOf('429') !== -1) {
+        recoveryBtn = '<p style="color:var(--yellow);margin-top:0.5rem;" id="retryCountdown">Please wait...</p>';
+      } else {
+        recoveryBtn = '<button class="btn" style="margin-top:1rem;" onclick="generate()">Try Again</button>';
+      }
+      result.innerHTML = '<p style="color:var(--red)">'+esc(errMsg)+'</p>' + recoveryBtn;
+      if (errMsg.indexOf('429') !== -1) startRetryCountdown();
     }
   }
   stopTimer();
@@ -1006,21 +1056,27 @@ function handleEvent(e) {
       r.classList.add('active');
       r.setAttribute('tabindex', '-1');
       r.focus();
+      var timer = document.getElementById('elapsedTimer');
+      var elapsed = timer ? timer.textContent : '';
       var html = '';
       if (e.gamma_url) {
         html += '<h2 class="result-header">Deck Ready</h2>';
+        if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx" style="margin-right:0.75rem;">Download PPTX</a>';
         html += '<a class="dl-btn" href="'+esc(e.gamma_url)+'" target="_blank">Edit in Gamma</a>';
       } else if (e.gamma_content) {
         html += '<h2 class="result-header">Deck Ready</h2>';
+        if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         html += '<p class="result-hint">Copy and paste into Gamma to generate your slides.</p>';
         html += '<textarea class="gamma-content" id="gammaContent" readonly aria-label="Deck content for Gamma">'+esc(e.gamma_content)+'</textarea>';
         html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
         html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;" role="status">Copied!</span>';
       } else {
         html += '<h2 class="result-header">Deck Ready</h2>';
+        if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx">Download PPTX</a>';
       }
+      html += '<div style="margin-top:1.5rem;"><button class="btn" style="background:var(--surface2);border:1px solid var(--border);" onclick="resetForm()">Generate Another Deck</button></div>';
       r.innerHTML = html;
       break;
     }
@@ -1046,6 +1102,48 @@ function copyGamma() {
   } else {
     document.execCommand('copy');
   }
+}
+
+function resetForm() {
+  document.getElementById('topic').value = '';
+  document.getElementById('topic').focus();
+  document.getElementById('result').classList.remove('active');
+  document.getElementById('pipeline').classList.remove('active');
+  document.getElementById('agentLog').innerHTML = '';
+  updateTopicCounter();
+  resetSteps();
+  var bar = document.getElementById('progressBar');
+  if (bar) { bar.style.width = '0%'; bar.setAttribute('aria-valuenow', '0'); }
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+function startRetryCountdown() {
+  var seconds = 60;
+  var el = document.getElementById('retryCountdown');
+  if (!el) return;
+  var iv = setInterval(function() {
+    seconds--;
+    if (seconds <= 0) {
+      clearInterval(iv);
+      el.innerHTML = '<button class="btn" onclick="generate()">Try Again</button>';
+    } else {
+      el.textContent = 'Rate limited. Retry in ' + seconds + 's...';
+    }
+  }, 1000);
+}
+
+function updateTopicCounter() {
+  var el = document.getElementById('topic');
+  var counter = document.getElementById('topicCounter');
+  if (el && counter) counter.textContent = el.value.length + '/500';
+}
+
+function clampSlides() {
+  var el = document.getElementById('numSlides');
+  if (!el) return;
+  var v = parseInt(el.value);
+  if (isNaN(v) || v < 5) el.value = 5;
+  else if (v > 25) el.value = 25;
 }
 
 window.addEventListener('beforeunload', function(e) {

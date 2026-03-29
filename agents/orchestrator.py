@@ -129,33 +129,30 @@ async def run_pipeline(
         return
 
     # ===== PHASE 2-4: Sequential agents with validation =====
-    # Each tuple: (name, factory for agent_fn, next_agent_name, summary_fn)
-    phases = [
-        (
-            "brief",
-            lambda: brief_agent.run(research_data, audience_context),
-            "architect",
-        ),
-        (
-            "architect",
-            lambda: architect_agent.run(
-                brief_result, audience_context, narrative, num_slides, tone, depth
-            ),
-            "writer",
-        ),
-        (
-            "writer",
-            lambda: writer_agent.run(outline_result, brief_result, audience_context),
-            "reviewer",
-        ),
-    ]
-
     brief_result = None
     outline_result = None
     content_result = None
 
-    for phase_name, agent_fn_factory, next_agent in phases:
+    def make_agent_fn(phase, feedback=""):
+        """Factory that creates agent callables with optional validation feedback."""
+        if phase == "brief":
+            return lambda: brief_agent.run(research_data, audience_context, validation_feedback=feedback)
+        elif phase == "architect":
+            return lambda: architect_agent.run(
+                brief_result, audience_context, narrative, num_slides, tone, depth, validation_feedback=feedback
+            )
+        elif phase == "writer":
+            return lambda: writer_agent.run(outline_result, brief_result, audience_context, validation_feedback=feedback)
+
+    phases = [
+        ("brief", "architect"),
+        ("architect", "writer"),
+        ("writer", "reviewer"),
+    ]
+
+    for phase_name, next_agent in phases:
         result = None
+        validation_feedback = ""
         for attempt in range(1 + MAX_RETRIES):
             label = " (retry)" if attempt > 0 else ""
 
@@ -166,9 +163,10 @@ async def run_pipeline(
             }
 
             # Run agent with heartbeats streaming in real-time
+            agent_fn = make_agent_fn(phase_name, feedback=validation_feedback)
             try:
                 async for event in _run_with_heartbeat(
-                    agent_fn_factory, phase_name, pipeline_start
+                    agent_fn, phase_name, pipeline_start
                 ):
                     if "_result" in event:
                         result = event["_result"]
@@ -205,6 +203,8 @@ async def run_pipeline(
                     break
                 else:
                     issues = "; ".join(v.get("issues", [])[:2])
+                    # Store feedback for retry so the agent can fix specific issues
+                    validation_feedback = f"Score: {v.get('score')}/10. Issues: {'; '.join(v.get('issues', []))}"
                     yield {
                         "event": "rejected",
                         "agent": "validator",
