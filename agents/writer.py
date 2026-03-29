@@ -78,7 +78,7 @@ Write the full content for every slide. Every field must be substantive."""
         result = await call_claude(
             system_prompt=self.SYSTEM_PROMPT,
             user_message=user_msg,
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             thinking_budget=5000,
             max_tokens=self._max_tokens_for_slides(num_slides),
         )

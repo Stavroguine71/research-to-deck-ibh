@@ -12,7 +12,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
 def validate_required_keys():
@@ -73,6 +73,12 @@ async def call_claude(
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
+            # Log the response body for diagnostics
+            try:
+                err_body = e.response.text[:500]
+            except Exception:
+                err_body = "(could not read response body)"
+            logger.error(f"Claude API {e.response.status_code}: {err_body}")
             # Only retry without thinking for 400/529 errors
             if thinking_budget > 0 and e.response.status_code in (400, 529):
                 logger.warning(f"Claude API {e.response.status_code} with thinking enabled, retrying without thinking")
