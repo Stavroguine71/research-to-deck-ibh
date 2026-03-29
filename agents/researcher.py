@@ -20,7 +20,6 @@ async def _tavily_search(query: str, max_results: int = 5) -> dict:
             "https://api.tavily.com/search",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "api_key": api_key,
                 "query": query,
                 "search_depth": "advanced",
                 "max_results": max_results,

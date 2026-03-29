@@ -11,11 +11,12 @@ import json
 import uuid
 import time
 import asyncio
+import secrets
 import httpx
 import tempfile
 import logging
 
-from fastapi import FastAPI, Request, Depends, HTTPException, Header
+from fastapi import FastAPI, Request, Depends, HTTPException, Header, Cookie, Response
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -52,25 +53,40 @@ async def security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    # CSP: allow inline styles/scripts (needed for single-page HTML), fonts from Google
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; "
-        "connect-src 'self'; "
-        "img-src 'self' data:; "
-        "frame-ancestors 'none'"
-    )
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # CSP with nonce for the homepage, restrictive for API routes
+    nonce = getattr(request.state, "csp_nonce", "")
+    if nonce:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            f"script-src 'self' 'nonce-{nonce}'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src https://fonts.gstatic.com; "
+            "connect-src 'self'; "
+            "img-src 'self' data:; "
+            "frame-ancestors 'none'"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "frame-ancestors 'none'"
+        )
     return response
 
 
 APP_API_KEY = os.environ.get("APP_API_KEY", "")
 TMPDIR = tempfile.mkdtemp()
 
+# Session tokens for cookie-based UI auth
+SESSIONS: dict = {}  # session_id -> creation_time
+MAX_SESSIONS = 50000
+
 # JOBS with timestamps for cleanup
 JOBS: dict = {}  # job_id -> {"path": str, "created_at": float}
 MAX_JOB_AGE = 3600  # 1 hour
+MAX_JOBS = 500  # Reject new jobs beyond this
 
 # Simple in-memory rate limiting
 RATE_LIMIT: dict = {}  # ip -> [timestamps]
@@ -97,8 +113,9 @@ async def startup():
 async def cleanup_loop():
     """Runs on the same event loop as the app — no race conditions."""
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(60)  # Every minute instead of 10 min
         now = time.time()
+        # Clean expired jobs and temp files
         expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
         for jid in expired:
             info = JOBS.pop(jid, None)
@@ -112,28 +129,48 @@ async def cleanup_loop():
         stale_ips = [ip for ip, ts in RATE_LIMIT.items() if not any(t > window_start for t in ts)]
         for ip in stale_ips:
             RATE_LIMIT.pop(ip, None)
+        # Clean expired sessions
+        expired_sessions = [sid for sid, created in SESSIONS.items() if now - created > MAX_JOB_AGE]
+        for sid in expired_sessions:
+            SESSIONS.pop(sid, None)
 
 
 # ============================================================
 # Authentication + Rate Limiting
 # ============================================================
 
-async def verify_api_key(x_api_key: str = Header(default="")):
-    """Check API key if APP_API_KEY is set. Skip auth if not configured."""
-    if APP_API_KEY and x_api_key != APP_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+async def verify_auth(
+    request: Request,
+    x_api_key: str = Header(default=""),
+    session: str = Cookie(default=""),
+):
+    """
+    Dual auth: accept either a valid X-API-Key header (for programmatic access)
+    or a valid session cookie (for the built-in UI). Both are checked against
+    APP_API_KEY-derived credentials.
+    """
+    # API key auth (programmatic clients)
+    if x_api_key and x_api_key == APP_API_KEY:
+        return
+    # Session cookie auth (browser UI)
+    if session and session in SESSIONS:
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized. Please reload the page or provide a valid API key.")
 
 
 MAX_RATE_ENTRIES = 10000
 
 
 def get_client_ip(request: Request) -> str:
-    """Use direct TCP connection IP — never trust X-Forwarded-For to prevent spoofing."""
+    """Trust X-Forwarded-For from Railway's reverse proxy (leftmost = real client)."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 def check_rate_limit(request: Request):
-    """In-memory rate limiter by IP. Returns remaining count for headers."""
+    """In-memory rate limiter by IP."""
     ip = get_client_ip(request)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW
@@ -363,18 +400,44 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    # Inject API key into HTML so the frontend can authenticate requests
-    return HTML_PAGE.replace("{{APP_API_KEY}}", APP_API_KEY)
+async def home(request: Request):
+    session_id = secrets.token_urlsafe(32)
+    SESSIONS[session_id] = time.time()
+    # Evict oldest sessions if too many
+    if len(SESSIONS) > MAX_SESSIONS:
+        oldest = min(SESSIONS, key=SESSIONS.get)
+        del SESSIONS[oldest]
+    # Generate nonce for CSP
+    nonce = secrets.token_urlsafe(16)
+    request.state.csp_nonce = nonce
+    html = HTML_PAGE.replace("{{NONCE}}", nonce)
+    response = HTMLResponse(html)
+    response.set_cookie(
+        "session", session_id,
+        httponly=True, samesite="strict", max_age=MAX_JOB_AGE,
+    )
+    return response
 
 
 @app.post("/api/generate")
-async def generate(request: Request, _=Depends(verify_api_key)):
+async def generate(request: Request, _=Depends(verify_auth)):
     """Stream the multi-agent pipeline progress, then generate via Gamma."""
+    # Parse and validate body BEFORE consuming a rate limit slot
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    try:
+        req = DeckRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     check_rate_limit(request)
 
-    body = await request.json()
-    req = DeckRequest(**body)
+    # Reject if too many active jobs
+    if len(JOBS) >= MAX_JOBS:
+        raise HTTPException(status_code=503, detail="Server busy. Please try again in a few minutes.")
+
     audience_context = build_audience_context(req)
 
     async def event_stream():
@@ -432,7 +495,7 @@ async def generate(request: Request, _=Depends(verify_api_key)):
 
 
 @app.get("/api/download/{job_id}")
-async def download(job_id: str, request: Request, _=Depends(verify_api_key)):
+async def download(job_id: str, request: Request, _=Depends(verify_auth)):
     # Validate job_id is a UUID to prevent injection
     try:
         uuid.UUID(job_id)
@@ -472,7 +535,6 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="api-key" content="{{APP_API_KEY}}">
 <title>Multi-Agent Research-to-Deck</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
 <style>
@@ -503,6 +565,11 @@ HTML_PAGE = """<!DOCTYPE html>
   input, select, textarea { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border);
     border-radius:8px; padding:0.7rem; font-size:0.9rem; margin-bottom:0.8rem; }
   input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); }
+  .btn:focus-visible, .dl-btn:focus-visible, .copy-btn:focus-visible, a:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px; }
+  .result:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; }
   .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0.75rem; }
   .collapse-btn { background:none; border:none; color:var(--accent); font-size:0.8rem; cursor:pointer;
@@ -561,6 +628,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .step:last-child { border-right:none; }
   .step.active { background:var(--accent); color:#fff; }
   .step.done { background:var(--green); color:#fff; }
+  .progress-bar-wrap { height:4px; background:var(--surface2); border-radius:2px; margin-bottom:0.75rem; overflow:hidden; }
+  .progress-bar-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); transition:width 0.5s ease; width:0%; }
 
   @media (max-width:600px) {
     .row3 { grid-template-columns:1fr; }
@@ -677,6 +746,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <span class="step" id="step-reviewer">Review</span>
       <span class="step" id="step-gamma">Design</span>
     </div>
+    <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progressBar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div></div>
     <h2>Agent Pipeline <span class="elapsed-timer" id="elapsedTimer"></span></h2>
     <p id="progressLabel" style="font-size:0.8rem;color:var(--text-dim);margin-bottom:0.5rem;"></p>
     <div id="agentLog" role="log" aria-live="polite" aria-label="Agent status updates"></div>
@@ -686,7 +756,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="result" id="result" role="region" aria-label="Result"></div>
 </main>
 
-<script>
+<script nonce="{{NONCE}}">
 function toggleSection(btn, id) {
   var el = document.getElementById(id);
   el.classList.toggle('open');
@@ -741,32 +811,31 @@ function stopTimer() {
   elapsedInterval = null;
 }
 
+var PHASE_PROGRESS = {researcher:16, brief:33, architect:50, writer:67, reviewer:83, gamma:100};
+
 function updateProgressLabel(agentName) {
   stepCount++;
   var el = document.getElementById('progressLabel');
   if (el) el.textContent = 'Step ' + stepCount + ' of ' + TOTAL_STEPS + ': ' + agentName;
+  var pct = PHASE_PROGRESS[agentName] || 0;
+  var bar = document.getElementById('progressBar');
+  if (bar) { bar.style.width = pct + '%'; bar.setAttribute('aria-valuenow', pct); }
 }
-
-var apiKey = '';
 
 async function generate() {
   var topicEl = document.getElementById('topic');
   var topic = topicEl.value.trim();
   var errEl = document.getElementById('topicError');
 
-  if (!topic) {
+  if (!topic || topic.length < 3) {
     topicEl.setAttribute('aria-invalid', 'true');
     errEl.style.display = 'block';
+    errEl.textContent = topic.length < 3 ? 'Topic must be at least 3 characters' : 'Please enter a research topic';
     topicEl.focus();
     return;
   }
   errEl.style.display = 'none';
   topicEl.removeAttribute('aria-invalid');
-
-  if (!apiKey) {
-    var meta = document.querySelector('meta[name="api-key"]');
-    apiKey = meta ? meta.content : '';
-  }
 
   var btn = document.getElementById('genBtn');
   var pipeline = document.getElementById('pipeline');
@@ -781,6 +850,8 @@ async function generate() {
   document.getElementById('agentLog').innerHTML = '';
   document.getElementById('elapsedTimer').textContent = '';
   document.getElementById('progressLabel').textContent = '';
+  var bar = document.getElementById('progressBar');
+  if (bar) { bar.style.width = '0%'; bar.setAttribute('aria-valuenow', '0'); }
   stepCount = 0;
   resetSteps();
   startTimer();
@@ -807,7 +878,7 @@ async function generate() {
   try {
     var res = await fetch('/api/generate', {
       method: 'POST',
-      headers: {'Content-Type':'application/json', 'X-API-Key': apiKey},
+      headers: {'Content-Type':'application/json'},
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -854,6 +925,7 @@ async function generate() {
 }
 
 function cancelGeneration() {
+  if (!confirm('Cancel deck generation? You will need to start over.')) return;
   if (controller) controller.abort();
   stopTimer();
   document.getElementById('cancelBtn').style.display = 'none';
@@ -937,7 +1009,7 @@ function handleEvent(e) {
       var html = '';
       if (e.gamma_url) {
         html += '<h2 class="result-header">Deck Ready</h2>';
-        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" style="margin-right:0.75rem;">Download PPTX</a>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx" style="margin-right:0.75rem;">Download PPTX</a>';
         html += '<a class="dl-btn" href="'+esc(e.gamma_url)+'" target="_blank">Edit in Gamma</a>';
       } else if (e.gamma_content) {
         html += '<h2 class="result-header">Deck Ready</h2>';
@@ -947,7 +1019,7 @@ function handleEvent(e) {
         html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;" role="status">Copied!</span>';
       } else {
         html += '<h2 class="result-header">Deck Ready</h2>';
-        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'">Download PPTX</a>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx">Download PPTX</a>';
       }
       r.innerHTML = html;
       break;

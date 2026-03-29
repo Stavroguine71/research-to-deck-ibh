@@ -15,7 +15,10 @@ Full pipeline with validation gates, retries, and SSE heartbeats:
 import json
 import time
 import asyncio
+import logging
 from typing import AsyncGenerator
+
+logger = logging.getLogger(__name__)
 from . import (
     ResearcherAgent,
     BriefAgent,
@@ -111,7 +114,8 @@ async def run_pipeline(
             "message": f"Research done — {research_data['total_results']} results from {research_data['queries_succeeded']}/4 queries ({elapsed()}s)",
         }
     except Exception as e:
-        yield {"event": "agent_error", "agent": "researcher", "message": "Research failed. Check API keys."}
+        logger.exception("Researcher agent failed")
+        yield {"event": "agent_error", "agent": "researcher", "message": f"Research failed ({type(e).__name__}). Check API keys."}
         yield {"event": "error", "message": "Research agent failed. Please try again."}
         return
 
@@ -171,7 +175,8 @@ async def run_pipeline(
                     else:
                         yield event  # heartbeat — streams immediately
             except Exception as e:
-                yield {"event": "agent_error", "agent": phase_name, "message": f"{phase_name.title()} agent encountered an error. Retrying..."}
+                logger.exception(f"{phase_name} agent failed on attempt {attempt + 1}")
+                yield {"event": "agent_error", "agent": phase_name, "message": f"{phase_name.title()} error: {type(e).__name__}. Retrying..."}
                 if attempt == MAX_RETRIES:
                     result = None
                     break
@@ -208,7 +213,8 @@ async def run_pipeline(
                     if attempt == MAX_RETRIES:
                         yield {"event": "warning", "message": "Proceeding despite validation failure"}
                         break
-            except Exception:
+            except Exception as ve:
+                logger.warning(f"Validator failed for {phase_name}: {ve}")
                 yield {
                     "event": "validated",
                     "agent": "validator",
@@ -255,9 +261,9 @@ async def run_pipeline(
             "message": f"Review done — score {overall}/10, {rewritten} slides rewritten ({elapsed()}s)",
         }
     except Exception as e:
-        yield {"event": "agent_error", "agent": "reviewer", "message": "Reviewer encountered an error. Using unreviewed content."}
-        review = content_result
-        review["overall_score"] = "N/A"
+        logger.exception("Reviewer agent failed")
+        yield {"event": "agent_error", "agent": "reviewer", "message": f"Reviewer error: {type(e).__name__}. Using unreviewed content."}
+        review = {**content_result, "overall_score": "N/A"}
 
     total_elapsed = round(time.time() - pipeline_start, 1)
 

@@ -65,7 +65,13 @@ Rules:
 - Verify the last slide has a clear, actionable ask.
 - Return ONLY valid JSON"""
 
+    @staticmethod
+    def _max_tokens_for_slides(num_slides: int) -> int:
+        """Scale token budget dynamically: ~800 tokens per slide + overhead for scores."""
+        return 10000 + (num_slides * 800)
+
     async def run(self, content: dict, brief: dict) -> dict:
+        num_slides = len(content.get("slides", []))
         user_msg = f"""Completed Slides:
 {json.dumps(content, indent=2)}
 
@@ -79,7 +85,7 @@ Score every slide. Rewrite anything below 4/5 on any dimension."""
             user_message=user_msg,
             model="claude-sonnet-4-20250514",
             thinking_budget=5000,
-            max_tokens=16000,
+            max_tokens=self._max_tokens_for_slides(num_slides),
         )
 
         review = parse_json_response(result["text"])
