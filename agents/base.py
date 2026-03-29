@@ -8,12 +8,10 @@ import re
 import time
 import httpx
 import os
-import sys
 import logging
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEFAULT_MODEL = "claude-opus-4-20250514"
 
 
@@ -25,11 +23,7 @@ def validate_required_keys():
     if not os.environ.get("TAVILY_API_KEY"):
         missing.append("TAVILY_API_KEY")
     if missing:
-        print(
-            f"FATAL: Missing required environment variables: {', '.join(missing)}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 
 async def call_claude(
@@ -45,8 +39,12 @@ async def call_claude(
     Each agent call goes through here — its own request, its own context.
     Supports extended thinking for deeper reasoning.
     """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
     headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
+        "x-api-key": api_key,
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
     }

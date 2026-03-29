@@ -10,9 +10,9 @@ import sys
 import json
 import uuid
 import time
+import asyncio
 import httpx
 import tempfile
-import threading
 import logging
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Header
@@ -23,10 +23,14 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Add parent directory to path so agents package is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agents.orchestrator import run_pipeline
-from agents.base import validate_required_keys
+try:
+    from agents.orchestrator import run_pipeline
+    from agents.base import validate_required_keys
+except ImportError:
+    # Fallback: add parent directory if running outside installed package
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from agents.orchestrator import run_pipeline
+    from agents.base import validate_required_keys
 
 app = FastAPI(title="Multi-Agent Research-to-Deck")
 
@@ -37,6 +41,29 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+# Security headers middleware
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # CSP: allow inline styles/scripts (needed for single-page HTML), fonts from Google
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none'"
+    )
+    return response
+
 
 GAMMA_API_KEY = os.environ.get("GAMMA_API_KEY", "")
 APP_API_KEY = os.environ.get("APP_API_KEY", "")
@@ -59,30 +86,33 @@ RATE_LIMIT_WINDOW = 300  # 5 minutes
 @app.on_event("startup")
 async def startup():
     validate_required_keys()
-    start_cleanup_loop()
+    if not APP_API_KEY:
+        logger.warning("APP_API_KEY not set — API is unauthenticated! Set this env var to secure your endpoint.")
+    asyncio.create_task(cleanup_loop())
 
 
 # ============================================================
-# Job cleanup — prevent unbounded growth
+# Job cleanup — async loop (no threading race condition)
 # ============================================================
 
-def cleanup_old_jobs():
-    now = time.time()
-    expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
-    for jid in expired:
-        info = JOBS.pop(jid, None)
-        if info and os.path.exists(info["path"]):
-            try:
-                os.remove(info["path"])
-            except OSError:
-                pass
-
-
-def start_cleanup_loop():
-    cleanup_old_jobs()
-    t = threading.Timer(600, start_cleanup_loop)
-    t.daemon = True
-    t.start()
+async def cleanup_loop():
+    """Runs on the same event loop as the app — no race conditions."""
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
+        for jid in expired:
+            info = JOBS.pop(jid, None)
+            if info and os.path.exists(info["path"]):
+                try:
+                    os.remove(info["path"])
+                except OSError:
+                    pass
+        # Clean stale rate limit entries
+        window_start = now - RATE_LIMIT_WINDOW
+        stale_ips = [ip for ip, ts in RATE_LIMIT.items() if not any(t > window_start for t in ts)]
+        for ip in stale_ips:
+            RATE_LIMIT.pop(ip, None)
 
 
 # ============================================================
@@ -95,20 +125,28 @@ async def verify_api_key(x_api_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def get_client_ip(request: Request) -> str:
+    """Handle X-Forwarded-For behind proxies."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def check_rate_limit(request: Request):
-    """Simple in-memory rate limiter by IP."""
-    ip = request.client.host if request.client else "unknown"
+    """In-memory rate limiter by IP."""
+    ip = get_client_ip(request)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW
 
-    # Clean old entries
     if ip in RATE_LIMIT:
         RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if t > window_start]
     else:
         RATE_LIMIT[ip] = []
 
     if len(RATE_LIMIT[ip]) >= RATE_LIMIT_MAX:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again in a few minutes.")
+        remaining = int(RATE_LIMIT_WINDOW - (now - RATE_LIMIT[ip][0]))
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {remaining} seconds.")
 
     RATE_LIMIT[ip].append(now)
 
@@ -118,16 +156,16 @@ def check_rate_limit(request: Request):
 # ============================================================
 
 class DeckRequest(BaseModel):
-    topic: str
+    topic: str = Field(..., max_length=500)
     purpose: str = "inform"
     num_slides: int = Field(default=10, ge=5, le=25)
     audience: str = "general_business"
     theme: str = "professional"
-    audience_role: Optional[str] = ""
+    audience_role: Optional[str] = Field(default="", max_length=200)
     audience_familiarity: Optional[str] = "some"
-    audience_motivation: Optional[str] = ""
-    audience_objections: Optional[str] = ""
-    desired_action: Optional[str] = ""
+    audience_motivation: Optional[str] = Field(default="", max_length=300)
+    audience_objections: Optional[str] = Field(default="", max_length=300)
+    desired_action: Optional[str] = Field(default="", max_length=300)
     narrative: Optional[str] = "pir"
     tone: Optional[str] = "authoritative"
     depth: Optional[str] = "standard"
@@ -276,12 +314,16 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         import asyncio
         for _ in range(40):
             await asyncio.sleep(3)
-            status_resp = await client.get(
-                f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
-                headers={"X-API-KEY": GAMMA_API_KEY},
-            )
-            status_resp.raise_for_status()
-            status = status_resp.json()
+            try:
+                status_resp = await client.get(
+                    f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
+                    headers={"X-API-KEY": GAMMA_API_KEY},
+                )
+                status_resp.raise_for_status()
+                status = status_resp.json()
+            except (httpx.HTTPError, httpx.TransportError) as e:
+                logger.warning(f"Gamma poll transient error: {e}")
+                continue
 
             if status.get("status") == "completed":
                 download_url = status.get("download_url") or status.get("exportUrl")
@@ -368,15 +410,42 @@ async def generate(request: Request, _=Depends(verify_api_key)):
         else:
             yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/download/{job_id}")
-async def download(job_id: str, _=Depends(verify_api_key)):
+async def download(job_id: str, request: Request, _=Depends(verify_api_key)):
+    # Validate job_id is a UUID to prevent injection
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
     info = JOBS.get(job_id)
     if not info or not os.path.exists(info["path"]):
-        return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(info["path"], filename="presentation.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;text-align:center;padding:4rem;background:#0a0b10;color:#e0e0e8;'>"
+                "<h1 style='color:#f87171;'>Download Expired</h1>"
+                "<p style='color:#a0a0b8;'>This download link has expired or the file was already cleaned up.</p>"
+                "<a href='/' style='color:#7c6aff;'>Generate a new deck</a>"
+                "</body></html>",
+                status_code=404,
+            )
+        return JSONResponse({"error": "File not found or expired"}, status_code=404)
+    # Path traversal protection
+    real_path = os.path.realpath(info["path"])
+    if not real_path.startswith(os.path.realpath(TMPDIR)):
+        return JSONResponse({"error": "Access denied"}, status_code=403)
+    return FileResponse(real_path, filename="presentation.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
 @app.get("/health")
@@ -394,6 +463,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Multi-Agent Research-to-Deck</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
 <style>
   :root {
     --bg: #0a0b10; --surface: #12131a; --surface2: #1a1b25;
@@ -466,6 +536,23 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size:0.8rem; resize:vertical; margin-top:1rem; white-space:pre-wrap; }
   .result-header { color:var(--green); margin-bottom:0.5rem; }
   .result-hint { color:var(--text-dim); font-size:0.8rem; margin-top:0.5rem; }
+  .collapse-btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); border:0; }
+
+  /* Progress steps */
+  .progress-steps { display:flex; gap:0; margin-bottom:1rem; border-radius:8px; overflow:hidden; }
+  .step { flex:1; text-align:center; padding:0.5rem 0.25rem; font-size:0.7rem; font-weight:600;
+    background:var(--surface2); color:var(--text-dim); border-right:1px solid var(--border);
+    transition:background 0.3s,color 0.3s; }
+  .step:last-child { border-right:none; }
+  .step.active { background:var(--accent); color:#fff; }
+  .step.done { background:var(--green); color:#fff; }
+
+  @media (max-width:600px) {
+    .row3 { grid-template-columns:1fr; }
+    .row { grid-template-columns:1fr; }
+    .step { font-size:0.6rem; padding:0.4rem 0.15rem; }
+  }
 </style>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
@@ -485,9 +572,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </header>
 
 <main class="container" style="padding-top:0;">
-  <form class="form-card" id="formCard" onsubmit="return false;">
+  <form class="form-card" id="formCard" onsubmit="event.preventDefault(); generate();">
+    <h2 style="font-size:1rem;color:var(--text);margin-bottom:0.75rem;">Configure Your Deck</h2>
     <label for="topic">Research Topic</label>
-    <input type="text" id="topic" required aria-required="true" placeholder="e.g. The future of AI agents in enterprise software">
+    <input type="text" id="topic" required aria-required="true" aria-describedby="topicError" placeholder="e.g. The future of AI agents in enterprise software">
     <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
 
     <div class="row">
@@ -562,12 +650,22 @@ HTML_PAGE = """<!DOCTYPE html>
       <textarea id="constraints" rows="2" placeholder="Any special requirements..."></textarea>
     </div>
 
-    <button type="button" class="btn" id="genBtn" onclick="generate()">Generate Deck</button>
+    <button type="submit" class="btn" id="genBtn">Generate Deck</button>
+    <button type="button" class="btn" id="cancelBtn" style="display:none;background:var(--red);margin-top:0.5rem;" onclick="cancelGeneration()">Cancel</button>
   </form>
 
   <div class="pipeline" id="pipeline" role="region" aria-label="Pipeline progress">
+    <div class="progress-steps" id="progressSteps" aria-label="Pipeline steps">
+      <span class="step" id="step-research">Research</span>
+      <span class="step" id="step-brief">Brief</span>
+      <span class="step" id="step-architect">Outline</span>
+      <span class="step" id="step-writer">Write</span>
+      <span class="step" id="step-reviewer">Review</span>
+      <span class="step" id="step-gamma">Design</span>
+    </div>
     <h2>Agent Pipeline</h2>
     <div id="agentLog" role="log" aria-live="polite" aria-label="Agent status updates"></div>
+    <div id="statusAnnounce" role="status" class="sr-only" aria-live="polite"></div>
   </div>
 
   <div class="result" id="result" role="region" aria-label="Result"></div>
@@ -625,9 +723,11 @@ async function generate() {
   controller = new AbortController();
   btn.disabled = true;
   btn.textContent = 'Agents running...';
+  document.getElementById('cancelBtn').style.display = 'block';
   pipeline.classList.add('active');
   result.classList.remove('active'); result.innerHTML = '';
   document.getElementById('agentLog').innerHTML = '';
+  resetSteps();
 
   var body = {
     topic: topic,
@@ -681,16 +781,61 @@ async function generate() {
     }
   }
   btn.disabled = false; btn.textContent = 'Generate Deck';
+  document.getElementById('cancelBtn').style.display = 'none';
   controller = null;
+}
+
+function cancelGeneration() {
+  if (controller) controller.abort();
+  document.getElementById('cancelBtn').style.display = 'none';
+  var btn = document.getElementById('genBtn');
+  btn.disabled = false;
+  btn.textContent = 'Generate Deck';
+  addAgentRow('system', 'Generation cancelled by user', 'error');
+  announce('Generation cancelled');
+}
+
+var STEP_MAP = {researcher:'step-research', brief:'step-brief', architect:'step-architect', writer:'step-writer', reviewer:'step-reviewer', gamma:'step-gamma'};
+
+function setStepActive(agent) {
+  var stepId = STEP_MAP[agent];
+  if (!stepId) return;
+  // Mark previous steps done
+  var steps = document.querySelectorAll('.step');
+  var found = false;
+  for (var i = 0; i < steps.length; i++) {
+    if (steps[i].id === stepId) { found = true; steps[i].className = 'step active'; }
+    else if (!found) { steps[i].className = 'step done'; }
+  }
+}
+
+function setStepDone(agent) {
+  var stepId = STEP_MAP[agent];
+  if (!stepId) return;
+  var el = document.getElementById(stepId);
+  if (el) el.className = 'step done';
+}
+
+function resetSteps() {
+  var steps = document.querySelectorAll('.step');
+  for (var i = 0; i < steps.length; i++) steps[i].className = 'step';
+}
+
+function announce(msg) {
+  var el = document.getElementById('statusAnnounce');
+  if (el) el.textContent = msg;
 }
 
 function handleEvent(e) {
   switch(e.event) {
     case 'agent_start':
       addAgentRow(e.agent || 'system', e.message, 'running');
+      setStepActive(e.agent);
+      announce(e.message);
       break;
     case 'agent_complete':
       updateLastRow('done', e.message);
+      setStepDone(e.agent);
       break;
     case 'agent_error':
       updateLastRow('error', e.message);
@@ -712,10 +857,13 @@ function handleEvent(e) {
       break;
     case 'pipeline_complete':
       addAgentRow('pipeline', e.message, 'done');
+      announce('Pipeline complete');
       break;
     case 'complete': {
       var r = document.getElementById('result');
       r.classList.add('active');
+      r.setAttribute('tabindex', '-1');
+      r.focus();
       var html = '';
       if (e.gamma_url) {
         html += '<h2 class="result-header">Deck Ready</h2>';
@@ -749,7 +897,7 @@ function copyGamma() {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(ta.value).then(function() {
       var msg = document.getElementById('copyMsg');
-      if (msg) { msg.style.display = 'inline'; setTimeout(function() { msg.style.display = 'none'; }, 2000); }
+      if (msg) { msg.style.display = 'inline'; setTimeout(function() { msg.style.display = 'none'; }, 3500); }
     }).catch(function() {
       document.execCommand('copy');
     });
