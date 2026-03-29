@@ -370,10 +370,12 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional"):
         )
         resp.raise_for_status()
         gen = resp.json()
-        gen_id = gen.get("id")
+        logger.info(f"Gamma generation response keys: {list(gen.keys())}")
+        logger.info(f"Gamma generation response (first 500 chars): {str(gen)[:500]}")
+        gen_id = gen.get("id") or gen.get("generationId") or gen.get("generation_id")
 
         if not gen_id:
-            yield {"error": "Gamma returned no generation ID", "gamma_url": None, "file_path": None}
+            yield {"error": f"Gamma returned no generation ID. Response keys: {list(gen.keys())}", "gamma_url": None, "file_path": None}
             return
 
         for poll_num in range(40):
