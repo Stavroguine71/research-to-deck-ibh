@@ -393,7 +393,9 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                     ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
                     if parsed.hostname not in ALLOWED_HOSTS:
                         return {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
-                    # DNS rebinding protection: resolve hostname, reject private IPs, pin resolved IP
+                    # SSRF protection: resolve hostname asynchronously, reject private IPs
+                    # We keep the original URL for the download (TLS needs the real hostname)
+                    # since the allowlist already limits to trusted Gamma domains.
                     try:
                         loop = asyncio.get_event_loop()
                         addrs = await loop.getaddrinfo(parsed.hostname, parsed.port or 443)
@@ -402,9 +404,9 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                             return {"error": "Download URL resolves to private IP", "gamma_url": None, "file_path": None}
                     except (socket.gaierror, ValueError, OSError):
                         return {"error": "Could not resolve download URL", "gamma_url": None, "file_path": None}
-                    # Download using pinned IP to prevent TOCTOU DNS rebinding
-                    pinned_url = download_url.replace(f"://{parsed.hostname}", f"://{resolved_ip}")
-                    dl = await client.get(pinned_url, headers={"Host": parsed.hostname})
+                    # Download with original URL — hostname allowlist + private IP check is sufficient
+                    # (TOCTOU DNS rebinding is mitigated by the strict hostname allowlist)
+                    dl = await client.get(download_url)
                     dl.raise_for_status()
                     # Use a local UUID for the filename — never trust gen_id from API
                     safe_filename = str(uuid.uuid4())

@@ -91,6 +91,10 @@ async def call_claude(
                     raise RuntimeError(
                         f"Claude API call failed after retry (status {retry_err.response.status_code})"
                     ) from retry_err
+                except Exception as retry_err:
+                    raise RuntimeError(
+                        "Claude API call failed after retry (network error)"
+                    ) from retry_err
             else:
                 raise
 

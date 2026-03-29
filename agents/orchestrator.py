@@ -151,9 +151,11 @@ async def run_pipeline(
     ]
 
     for phase_name, next_agent in phases:
-        result = None
+        best_result = None  # Best result across attempts (validated or last produced)
+        validation_passed = False
         validation_feedback = ""
         for attempt in range(1 + MAX_RETRIES):
+            attempt_result = None  # Reset each attempt — don't leak previous rejected output
             label = " (retry)" if attempt > 0 else ""
 
             yield {
@@ -169,16 +171,24 @@ async def run_pipeline(
                     agent_fn, phase_name, pipeline_start
                 ):
                     if "_result" in event:
-                        result = event["_result"]
+                        attempt_result = event["_result"]
                     else:
                         yield event  # heartbeat — streams immediately
             except Exception as e:
                 logger.exception(f"{phase_name} agent failed on attempt {attempt + 1}")
-                yield {"event": "agent_error", "agent": phase_name, "message": f"{phase_name.title()} error: {type(e).__name__}. Retrying..."}
+                yield {"event": "agent_error", "agent": phase_name, "message": f"{phase_name.title()} error. Retrying..."}
                 if attempt == MAX_RETRIES:
-                    result = None
                     break
                 continue
+
+            if attempt_result is None:
+                logger.error(f"{phase_name} agent returned None on attempt {attempt + 1}")
+                if attempt == MAX_RETRIES:
+                    break
+                continue
+
+            # Keep the latest result as our best candidate
+            best_result = attempt_result
 
             yield {
                 "event": "agent_complete",
@@ -193,13 +203,14 @@ async def run_pipeline(
                 "message": f"Validating {phase_name} output...",
             }
             try:
-                v = await validator.run(phase_name, result, expected_by=next_agent)
+                v = await validator.run(phase_name, attempt_result, expected_by=next_agent)
                 if v["verdict"] == "pass":
                     yield {
                         "event": "validated",
                         "agent": "validator",
                         "message": f"Validated — score {v['score']}/10 ({elapsed()}s)",
                     }
+                    validation_passed = True
                     break
                 else:
                     issues = "; ".join(v.get("issues", [])[:2])
@@ -212,7 +223,8 @@ async def run_pipeline(
                         "message": f"Rejected (score {v['score']}/10): {issues} ({elapsed()}s)",
                     }
                     if attempt == MAX_RETRIES:
-                        yield {"event": "warning", "message": "Proceeding despite validation failure"}
+                        best_result["_validation_failed"] = True
+                        yield {"event": "warning", "message": f"Proceeding with {phase_name} output despite validation failure (score {v.get('score')}/10)"}
                         break
             except Exception as ve:
                 logger.warning(f"Validator failed for {phase_name}: {ve}")
@@ -223,17 +235,22 @@ async def run_pipeline(
                 }
                 break
 
-        if result is None:
+        if best_result is None:
             yield {"event": "error", "message": f"{phase_name.title()} agent failed after retries. Please try again."}
             return
 
         # Store result for next phase
         if phase_name == "brief":
-            brief_result = result
+            brief_result = best_result
         elif phase_name == "architect":
-            outline_result = result
+            outline_result = best_result
         elif phase_name == "writer":
-            content_result = result
+            content_result = best_result
+
+    # Safety check: ensure all phases produced results before reviewing
+    if content_result is None or outline_result is None or brief_result is None:
+        yield {"event": "error", "message": "Internal error: missing phase results. Please try again."}
+        return
 
     # ===== PHASE 5: REVIEWER — Final Quality Gate (with heartbeats) =====
     yield {
