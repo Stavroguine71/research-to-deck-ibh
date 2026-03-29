@@ -4,12 +4,32 @@ Each agent gets its own independent Claude API call.
 """
 
 import json
+import re
 import time
 import httpx
 import os
+import sys
+import logging
+
+logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEFAULT_MODEL = "claude-opus-4-20250514"
+
+
+def validate_required_keys():
+    """Fail fast at startup if required API keys are missing."""
+    missing = []
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        missing.append("ANTHROPIC_API_KEY")
+    if not os.environ.get("TAVILY_API_KEY"):
+        missing.append("TAVILY_API_KEY")
+    if missing:
+        print(
+            f"FATAL: Missing required environment variables: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 async def call_claude(
@@ -54,9 +74,9 @@ async def call_claude(
             )
             resp.raise_for_status()
             data = resp.json()
-        except Exception as e:
-            # Retry without thinking if it fails
-            if thinking_budget > 0:
+        except httpx.HTTPStatusError as e:
+            # Only retry without thinking for 400/529 errors
+            if thinking_budget > 0 and e.response.status_code in (400, 529):
                 body.pop("thinking", None)
                 body.pop("temperature", None)
                 headers.pop("anthropic-beta", None)
@@ -69,6 +89,8 @@ async def call_claude(
                 data = resp.json()
             else:
                 raise
+        except Exception:
+            raise
 
     elapsed = round(time.time() - start, 1)
 
@@ -88,9 +110,37 @@ async def call_claude(
 
 
 def parse_json_response(text: str) -> dict:
-    """Parse JSON from Claude's response, handling markdown fences."""
+    """Parse JSON from Claude's response, handling common output variations."""
     cleaned = text.strip()
+
+    # Strip markdown code fences
     if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1]
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
         cleaned = cleaned.rsplit("```", 1)[0]
-    return json.loads(cleaned)
+        cleaned = cleaned.strip()
+
+    # First try: direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Second try: extract the largest JSON object from the text
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Third try: extract JSON array
+    match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    if match:
+        try:
+            return {"slides": json.loads(match.group())}
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        f"Could not parse JSON from Claude response (first 200 chars): {text[:200]}"
+    )

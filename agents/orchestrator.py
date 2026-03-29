@@ -107,7 +107,14 @@ async def run_pipeline(
             "message": f"Research done — {research_data['total_results']} results from {research_data['queries_succeeded']}/4 queries ({elapsed()}s)",
         }
     except Exception as e:
-        yield {"event": "agent_error", "agent": "researcher", "message": str(e)}
+        yield {"event": "agent_error", "agent": "researcher", "message": "Research failed. Check API keys."}
+        yield {"event": "error", "message": "Research agent failed. Please try again."}
+        return
+
+    # Check for empty research results
+    if research_data.get("total_results", 0) == 0:
+        yield {"event": "agent_error", "agent": "researcher", "message": "No research results found. Check your Tavily API key."}
+        yield {"event": "error", "message": "Research returned no results. Cannot build a deck without data."}
         return
 
     # ===== PHASE 2-4: Sequential agents with validation =====
@@ -157,7 +164,7 @@ async def run_pipeline(
                     else:
                         yield event  # heartbeat — streams immediately
             except Exception as e:
-                yield {"event": "agent_error", "agent": phase_name, "message": str(e)}
+                yield {"event": "agent_error", "agent": phase_name, "message": f"{phase_name.title()} agent encountered an error. Retrying..."}
                 if attempt == MAX_RETRIES:
                     result = None
                     break
@@ -203,6 +210,7 @@ async def run_pipeline(
                 break
 
         if result is None:
+            yield {"event": "error", "message": f"{phase_name.title()} agent failed after retries. Please try again."}
             return
 
         # Store result for next phase
@@ -257,7 +265,7 @@ async def run_pipeline(
             "message": f"Review done — score {overall}/10, {rewritten} slides rewritten ({elapsed()}s)",
         }
     except Exception as e:
-        yield {"event": "agent_error", "agent": "reviewer", "message": str(e)}
+        yield {"event": "agent_error", "agent": "reviewer", "message": "Reviewer encountered an error. Using unreviewed content."}
         review = content_result
         review["overall_score"] = "N/A"
 

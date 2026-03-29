@@ -1,42 +1,120 @@
 """
 Multi-Agent Research-to-Deck — Main Application
 =================================================
-True multi-agent pipeline with 6 independent agents:
-  1. Researcher — 4 parallel Tavily queries
-  2. Brief Writer — synthesizes research
-  3. Validator — quality gates between passes (NEW)
-  4. Architect — designs slide skeleton
-  5. Writer — fills full content
-  6. Reviewer — partner-level quality gate with rewrites
-
-Gamma integration preserved for design + PPTX export.
+True multi-agent pipeline with 6 independent agents.
+Gamma integration for design + PPTX export.
 """
 
 import os
 import sys
 import json
 import uuid
+import time
 import httpx
 import tempfile
+import threading
+import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path so agents package is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents.orchestrator import run_pipeline
+from agents.base import validate_required_keys
 
 app = FastAPI(title="Multi-Agent Research-to-Deck")
 
+# Restrictive CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[],  # No cross-origin by default
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 GAMMA_API_KEY = os.environ.get("GAMMA_API_KEY", "")
+APP_API_KEY = os.environ.get("APP_API_KEY", "")
 TMPDIR = tempfile.mkdtemp()
-JOBS: dict = {}
+
+# JOBS with timestamps for cleanup
+JOBS: dict = {}  # job_id -> {"path": str, "created_at": float}
+MAX_JOB_AGE = 3600  # 1 hour
+
+# Simple in-memory rate limiting
+RATE_LIMIT: dict = {}  # ip -> [timestamps]
+RATE_LIMIT_MAX = 5  # requests per window
+RATE_LIMIT_WINDOW = 300  # 5 minutes
 
 
 # ============================================================
-# Pydantic Models (same as your existing version)
+# Startup validation
+# ============================================================
+
+@app.on_event("startup")
+async def startup():
+    validate_required_keys()
+    start_cleanup_loop()
+
+
+# ============================================================
+# Job cleanup — prevent unbounded growth
+# ============================================================
+
+def cleanup_old_jobs():
+    now = time.time()
+    expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
+    for jid in expired:
+        info = JOBS.pop(jid, None)
+        if info and os.path.exists(info["path"]):
+            try:
+                os.remove(info["path"])
+            except OSError:
+                pass
+
+
+def start_cleanup_loop():
+    cleanup_old_jobs()
+    t = threading.Timer(600, start_cleanup_loop)
+    t.daemon = True
+    t.start()
+
+
+# ============================================================
+# Authentication + Rate Limiting
+# ============================================================
+
+async def verify_api_key(x_api_key: str = Header(default="")):
+    """Check API key if APP_API_KEY is set. Skip auth if not configured."""
+    if APP_API_KEY and x_api_key != APP_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def check_rate_limit(request: Request):
+    """Simple in-memory rate limiter by IP."""
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+
+    # Clean old entries
+    if ip in RATE_LIMIT:
+        RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if t > window_start]
+    else:
+        RATE_LIMIT[ip] = []
+
+    if len(RATE_LIMIT[ip]) >= RATE_LIMIT_MAX:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again in a few minutes.")
+
+    RATE_LIMIT[ip].append(now)
+
+
+# ============================================================
+# Pydantic Models
 # ============================================================
 
 class DeckRequest(BaseModel):
@@ -58,7 +136,7 @@ class DeckRequest(BaseModel):
 
 
 # ============================================================
-# Audience context builder (same as your existing version)
+# Audience context builder
 # ============================================================
 
 AUDIENCE_PERSONAS = {
@@ -90,7 +168,7 @@ def build_audience_context(req: DeckRequest) -> str:
 
 
 # ============================================================
-# Gamma Integration (preserved from your existing version)
+# Gamma Integration
 # ============================================================
 
 async def format_deck_for_gamma(deck_plan: dict) -> str:
@@ -171,7 +249,6 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
     }
 
     async with httpx.AsyncClient(timeout=180.0) as client:
-        # Start generation
         resp = await client.post(
             "https://public-api.gamma.app/v1.0/generations",
             headers={
@@ -196,9 +273,8 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         if not gen_id:
             return {"error": "Gamma returned no generation ID", "gamma_url": None, "file_path": None}
 
-        # Poll for completion
         import asyncio
-        for _ in range(40):  # 40 * 3s = 120s max
+        for _ in range(40):
             await asyncio.sleep(3)
             status_resp = await client.get(
                 f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
@@ -241,8 +317,10 @@ async def home():
 
 
 @app.post("/api/generate")
-async def generate(request: Request):
+async def generate(request: Request, _=Depends(verify_api_key)):
     """Stream the multi-agent pipeline progress, then generate via Gamma."""
+    check_rate_limit(request)
+
     body = await request.json()
     req = DeckRequest(**body)
     audience_context = build_audience_context(req)
@@ -250,7 +328,6 @@ async def generate(request: Request):
     async def event_stream():
         deck_plan = None
 
-        # Run the multi-agent pipeline with streaming events
         async for event in run_pipeline(
             topic=req.topic,
             audience_context=audience_context,
@@ -277,30 +354,29 @@ async def generate(request: Request):
                 gamma_result = await generate_via_gamma(deck_plan, req.theme)
                 if gamma_result.get("error"):
                     yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': gamma_result['error']})}\n\n"
-                    # Fallback: show copyable content
                     yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
                 else:
                     job_id = str(uuid.uuid4())
                     if gamma_result.get("file_path"):
-                        JOBS[job_id] = gamma_result["file_path"]
+                        JOBS[job_id] = {"path": gamma_result["file_path"], "created_at": time.time()}
                     yield f"data: {json.dumps({'event': 'agent_complete', 'agent': 'gamma', 'message': 'Gamma design complete'})}\n\n"
                     yield f"data: {json.dumps({'event': 'complete', 'job_id': job_id, 'gamma_url': gamma_result.get('gamma_url')})}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': str(e)})}\n\n"
+                logger.exception("Gamma API error")
+                yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': 'Gamma design failed'})}\n\n"
                 yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
         else:
-            # No API key — show copyable content
             yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/download/{job_id}")
-async def download(job_id: str):
-    path = JOBS.get(job_id)
-    if not path or not os.path.exists(path):
+async def download(job_id: str, _=Depends(verify_api_key)):
+    info = JOBS.get(job_id)
+    if not info or not os.path.exists(info["path"]):
         return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(path, filename="presentation.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    return FileResponse(info["path"], filename="presentation.pptx", media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
 @app.get("/health")
@@ -309,7 +385,7 @@ async def health():
 
 
 # ============================================================
-# Frontend UI with real-time agent status tracking
+# Frontend UI
 # ============================================================
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -321,12 +397,14 @@ HTML_PAGE = """<!DOCTYPE html>
 <style>
   :root {
     --bg: #0a0b10; --surface: #12131a; --surface2: #1a1b25;
-    --border: #2a2b3a; --text: #e0e0e8; --text-dim: #8888a0;
+    --border: #2a2b3a; --text: #e0e0e8; --text-dim: #a0a0b8;
     --accent: #7c6aff; --accent-glow: rgba(124,106,255,0.15);
     --green: #34d399; --yellow: #fbbf24; --red: #f87171; --blue: #60a5fa;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:'Inter',-apple-system,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+  .skip-link { position:absolute; top:-40px; left:0; background:var(--accent); color:#fff; padding:8px; z-index:100; }
+  .skip-link:focus { top:0; }
   .container { max-width:720px; margin:0 auto; padding:2rem 1.5rem; }
   h1 { font-size:1.6rem; font-weight:700; text-align:center;
     background:linear-gradient(135deg,#7c6aff,#60a5fa);
@@ -347,9 +425,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .row { display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; }
   .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0.75rem; }
   .collapse-btn { background:none; border:none; color:var(--accent); font-size:0.8rem; cursor:pointer;
-    padding:0.3rem 0; margin-bottom:0.5rem; text-align:left; }
+    padding:0.3rem 0; margin-bottom:0.5rem; text-align:left; min-height:44px; }
   .collapse-content { display:none; }
   .collapse-content.open { display:block; }
+  .topic-error { color:var(--red); font-size:0.8rem; display:none; margin-bottom:0.5rem; }
 
   .btn { background:var(--accent); color:#fff; border:none; padding:0.75rem 2rem; border-radius:8px;
     font-size:0.95rem; font-weight:600; cursor:pointer; width:100%; margin-top:0.5rem; }
@@ -360,7 +439,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .pipeline { display:none; background:var(--surface); border:1px solid var(--border);
     border-radius:12px; padding:1.25rem; margin-bottom:1.5rem; }
   .pipeline.active { display:block; }
-  .pipeline h3 { font-size:0.9rem; color:var(--text-dim); margin-bottom:0.75rem; }
+  .pipeline h2 { font-size:0.9rem; color:var(--text-dim); margin-bottom:0.75rem; }
   .agent-row { display:flex; align-items:center; gap:0.6rem; padding:0.4rem 0;
     border-bottom:1px solid var(--border); font-size:0.82rem; }
   .agent-row:last-child { border-bottom:none; }
@@ -391,10 +470,11 @@ HTML_PAGE = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="container">
+<a href="#formCard" class="skip-link">Skip to form</a>
+<header class="container" style="padding-bottom:0;">
   <h1>Multi-Agent Research-to-Deck</h1>
   <p class="subtitle">6 independent AI agents build your presentation in parallel</p>
-  <div class="badge-row">
+  <div class="badge-row" aria-hidden="true">
     <span class="badge"><span class="dot" style="background:var(--blue)"></span>Researcher</span>
     <span class="badge"><span class="dot" style="background:var(--green)"></span>Brief</span>
     <span class="badge"><span class="dot" style="background:var(--yellow)"></span>Validator</span>
@@ -402,24 +482,27 @@ HTML_PAGE = """<!DOCTYPE html>
     <span class="badge"><span class="dot" style="background:var(--red)"></span>Writer</span>
     <span class="badge"><span class="dot" style="background:#c084fc"></span>Reviewer</span>
   </div>
+</header>
 
-  <div class="form-card" id="formCard">
-    <label>Research Topic</label>
-    <input type="text" id="topic" placeholder="e.g. The future of AI agents in enterprise software">
+<main class="container" style="padding-top:0;">
+  <form class="form-card" id="formCard" onsubmit="return false;">
+    <label for="topic">Research Topic</label>
+    <input type="text" id="topic" required aria-required="true" placeholder="e.g. The future of AI agents in enterprise software">
+    <div class="topic-error" id="topicError" role="alert">Please enter a research topic</div>
 
     <div class="row">
-      <div><label>Purpose</label>
+      <div><label for="purpose">Purpose</label>
         <select id="purpose">
           <option value="inform">Inform</option><option value="persuade">Persuade</option>
           <option value="sell">Sell</option><option value="educate">Educate</option>
           <option value="report">Report</option><option value="pitch">Pitch</option>
         </select></div>
-      <div><label>Slides</label>
+      <div><label for="numSlides">Slides</label>
         <input type="number" id="numSlides" value="10" min="5" max="25"></div>
     </div>
 
     <div class="row">
-      <div><label>Audience</label>
+      <div><label for="audience">Audience</label>
         <select id="audience">
           <option value="general_business">General Business</option>
           <option value="c_suite">C-Suite</option>
@@ -428,7 +511,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <option value="investors">Investors</option>
           <option value="regulators">Regulators</option>
         </select></div>
-      <div><label>Design Theme</label>
+      <div><label for="theme">Design Theme</label>
         <select id="theme">
           <option value="professional">Professional</option>
           <option value="minimal">Minimal</option>
@@ -436,31 +519,31 @@ HTML_PAGE = """<!DOCTYPE html>
         </select></div>
     </div>
 
-    <button class="collapse-btn" onclick="toggle('audienceDetail')">+ Audience Detail</button>
+    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="audienceDetail" data-label="Audience Detail" onclick="toggleSection(this,'audienceDetail')">+ Audience Detail</button>
     <div class="collapse-content" id="audienceDetail">
       <div class="row">
-        <div><label>Role</label><input type="text" id="audienceRole" placeholder="e.g. VP Engineering"></div>
-        <div><label>Familiarity</label>
+        <div><label for="audienceRole">Role</label><input type="text" id="audienceRole" placeholder="e.g. VP Engineering"></div>
+        <div><label for="audienceFamiliarity">Familiarity</label>
           <select id="audienceFamiliarity">
             <option value="none">None</option><option value="some" selected>Some</option>
             <option value="expert">Expert</option>
           </select></div>
       </div>
-      <label>Motivation</label><input type="text" id="audienceMotivation" placeholder="What brought them to this meeting?">
-      <label>Likely Objections</label><input type="text" id="audienceObjections" placeholder="What will they push back on?">
-      <label>Desired Action</label><input type="text" id="desiredAction" placeholder="What should they do after?">
+      <label for="audienceMotivation">Motivation</label><input type="text" id="audienceMotivation" placeholder="What brought them to this meeting?">
+      <label for="audienceObjections">Likely Objections</label><input type="text" id="audienceObjections" placeholder="What will they push back on?">
+      <label for="desiredAction">Desired Action</label><input type="text" id="desiredAction" placeholder="What should they do after?">
     </div>
 
-    <button class="collapse-btn" onclick="toggle('narrativeDetail')">+ Narrative & Tone</button>
+    <button type="button" class="collapse-btn" aria-expanded="false" aria-controls="narrativeDetail" data-label="Narrative & Tone" onclick="toggleSection(this,'narrativeDetail')">+ Narrative & Tone</button>
     <div class="collapse-content" id="narrativeDetail">
       <div class="row3">
-        <div><label>Narrative Arc</label>
+        <div><label for="narrative">Narrative Arc</label>
           <select id="narrative">
             <option value="pir">PIR (McKinsey)</option>
             <option value="scqa">SCQA (BCG)</option>
             <option value="change">Change Story</option>
           </select></div>
-        <div><label>Tone</label>
+        <div><label for="tone">Tone</label>
           <select id="tone">
             <option value="authoritative">Authoritative</option>
             <option value="collaborative">Collaborative</option>
@@ -468,107 +551,137 @@ HTML_PAGE = """<!DOCTYPE html>
             <option value="neutral">Neutral</option>
             <option value="inspirational">Inspirational</option>
           </select></div>
-        <div><label>Depth</label>
+        <div><label for="depth">Depth</label>
           <select id="depth">
             <option value="overview">Overview</option>
             <option value="standard" selected>Standard</option>
             <option value="deep">Deep Dive</option>
           </select></div>
       </div>
-      <label>Constraints</label>
+      <label for="constraints">Constraints</label>
       <textarea id="constraints" rows="2" placeholder="Any special requirements..."></textarea>
     </div>
 
-    <button class="btn" id="genBtn" onclick="generate()">Generate Deck</button>
+    <button type="button" class="btn" id="genBtn" onclick="generate()">Generate Deck</button>
+  </form>
+
+  <div class="pipeline" id="pipeline" role="region" aria-label="Pipeline progress">
+    <h2>Agent Pipeline</h2>
+    <div id="agentLog" role="log" aria-live="polite" aria-label="Agent status updates"></div>
   </div>
 
-  <div class="pipeline" id="pipeline">
-    <h3>Agent Pipeline</h3>
-    <div id="agentLog"></div>
-  </div>
-
-  <div class="result" id="result"></div>
-</div>
+  <div class="result" id="result" role="region" aria-label="Result"></div>
+</main>
 
 <script>
-function toggle(id) { document.getElementById(id).classList.toggle('open'); }
+function toggleSection(btn, id) {
+  var el = document.getElementById(id);
+  el.classList.toggle('open');
+  var isOpen = el.classList.contains('open');
+  btn.setAttribute('aria-expanded', isOpen);
+  btn.textContent = (isOpen ? '- ' : '+ ') + btn.dataset.label;
+}
 
 function addAgentRow(agent, msg, status) {
-  const log = document.getElementById('agentLog');
-  const id = 'row-' + agent + '-' + Date.now();
-  const row = document.createElement('div');
+  var log = document.getElementById('agentLog');
+  var id = 'row-' + agent + '-' + Date.now();
+  var row = document.createElement('div');
   row.className = 'agent-row';
   row.id = id;
-  row.innerHTML = '<div class="agent-dot '+status+'"></div><span class="agent-label">'+esc(agent)+'</span><span class="agent-msg">'+esc(msg)+'</span>';
+  row.innerHTML = '<div class="agent-dot '+status+'" aria-hidden="true"></div><span class="agent-label">'+esc(agent)+'</span><span class="agent-msg">'+esc(msg)+'</span>';
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;
   return id;
 }
 
 function updateLastRow(status, msg) {
-  const rows = document.querySelectorAll('.agent-row');
+  var rows = document.querySelectorAll('.agent-row');
   if (!rows.length) return;
-  const last = rows[rows.length - 1];
+  var last = rows[rows.length - 1];
   last.querySelector('.agent-dot').className = 'agent-dot ' + status;
   if (msg) last.querySelector('.agent-msg').textContent = msg;
 }
 
+var controller;
+
 async function generate() {
-  const topic = document.getElementById('topic').value.trim();
-  if (!topic) return;
+  var topicEl = document.getElementById('topic');
+  var topic = topicEl.value.trim();
+  var errEl = document.getElementById('topicError');
 
-  const btn = document.getElementById('genBtn');
-  const pipeline = document.getElementById('pipeline');
-  const result = document.getElementById('result');
+  if (!topic) {
+    topicEl.setAttribute('aria-invalid', 'true');
+    errEl.style.display = 'block';
+    topicEl.focus();
+    return;
+  }
+  errEl.style.display = 'none';
+  topicEl.removeAttribute('aria-invalid');
 
-  btn.disabled = true; btn.textContent = 'Agents running...';
+  var btn = document.getElementById('genBtn');
+  var pipeline = document.getElementById('pipeline');
+  var result = document.getElementById('result');
+
+  controller = new AbortController();
+  btn.disabled = true;
+  btn.textContent = 'Agents running...';
   pipeline.classList.add('active');
   result.classList.remove('active'); result.innerHTML = '';
   document.getElementById('agentLog').innerHTML = '';
 
-  const body = {
-    topic,
+  var body = {
+    topic: topic,
     purpose: document.getElementById('purpose').value,
     num_slides: parseInt(document.getElementById('numSlides').value),
     audience: document.getElementById('audience').value,
     theme: document.getElementById('theme').value,
-    audience_role: document.getElementById('audienceRole')?.value || '',
-    audience_familiarity: document.getElementById('audienceFamiliarity')?.value || 'some',
-    audience_motivation: document.getElementById('audienceMotivation')?.value || '',
-    audience_objections: document.getElementById('audienceObjections')?.value || '',
-    desired_action: document.getElementById('desiredAction')?.value || '',
-    narrative: document.getElementById('narrative')?.value || 'pir',
-    tone: document.getElementById('tone')?.value || 'authoritative',
-    depth: document.getElementById('depth')?.value || 'standard',
-    constraints: document.getElementById('constraints')?.value || '',
+    audience_role: document.getElementById('audienceRole') ? document.getElementById('audienceRole').value : '',
+    audience_familiarity: document.getElementById('audienceFamiliarity') ? document.getElementById('audienceFamiliarity').value : 'some',
+    audience_motivation: document.getElementById('audienceMotivation') ? document.getElementById('audienceMotivation').value : '',
+    audience_objections: document.getElementById('audienceObjections') ? document.getElementById('audienceObjections').value : '',
+    desired_action: document.getElementById('desiredAction') ? document.getElementById('desiredAction').value : '',
+    narrative: document.getElementById('narrative') ? document.getElementById('narrative').value : 'pir',
+    tone: document.getElementById('tone') ? document.getElementById('tone').value : 'authoritative',
+    depth: document.getElementById('depth') ? document.getElementById('depth').value : 'standard',
+    constraints: document.getElementById('constraints') ? document.getElementById('constraints').value : ''
   };
 
   try {
-    const res = await fetch('/api/generate', {
+    var res = await fetch('/api/generate', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: controller.signal
     });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+
+    if (!res.ok) {
+      var errData = await res.json().catch(function() { return {}; });
+      throw new Error(errData.detail || 'Server error ' + res.status);
+    }
+
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '';
 
     while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, {stream:true});
-      const lines = buffer.split('\\n');
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, {stream:true});
+      var lines = buffer.split('\\n');
       buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try { handleEvent(JSON.parse(line.slice(6))); } catch(e) {}
+      for (var i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith('data: ')) continue;
+        try { handleEvent(JSON.parse(lines[i].slice(6))); } catch(e) {}
       }
     }
   } catch(e) {
-    result.classList.add('active');
-    result.innerHTML = '<p style="color:var(--red)">'+esc(e.message)+'</p>';
+    if (e.name !== 'AbortError') {
+      result.classList.add('active');
+      result.innerHTML = '<p style="color:var(--red)">'+esc(e.message || 'Network error')+'</p>';
+    }
   }
   btn.disabled = false; btn.textContent = 'Generate Deck';
+  controller = null;
 }
 
 function handleEvent(e) {
@@ -601,22 +714,22 @@ function handleEvent(e) {
       addAgentRow('pipeline', e.message, 'done');
       break;
     case 'complete': {
-      const r = document.getElementById('result');
+      var r = document.getElementById('result');
       r.classList.add('active');
-      let html = '';
+      var html = '';
       if (e.gamma_url) {
         html += '<h2 class="result-header">Deck Ready</h2>';
-        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+e.job_id+'" style="margin-right:0.75rem;">Download PPTX</a>';
-        html += '<a class="dl-btn" href="'+e.gamma_url+'" target="_blank">Edit in Gamma</a>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" style="margin-right:0.75rem;">Download PPTX</a>';
+        html += '<a class="dl-btn" href="'+esc(e.gamma_url)+'" target="_blank">Edit in Gamma</a>';
       } else if (e.gamma_content) {
-        html += '<h2 class="result-header">Deck Ready — Copy to Gamma</h2>';
-        html += '<p class="result-hint">Paste this into Gamma (Import document or Paste content) to generate your slides.</p>';
-        html += '<textarea class="gamma-content" id="gammaContent" readonly>'+esc(e.gamma_content)+'</textarea>';
+        html += '<h2 class="result-header">Deck Ready</h2>';
+        html += '<p class="result-hint">Copy and paste into Gamma to generate your slides.</p>';
+        html += '<textarea class="gamma-content" id="gammaContent" readonly aria-label="Deck content for Gamma">'+esc(e.gamma_content)+'</textarea>';
         html += '<button class="copy-btn" onclick="copyGamma()">Copy to Clipboard</button>';
-        html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;">Copied!</span>';
+        html += '<span id="copyMsg" style="margin-left:0.75rem;color:var(--green);font-size:0.85rem;display:none;" role="status">Copied!</span>';
       } else {
         html += '<h2 class="result-header">Deck Ready</h2>';
-        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+e.job_id+'">Download PPTX</a>';
+        if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'">Download PPTX</a>';
       }
       r.innerHTML = html;
       break;
@@ -627,17 +740,27 @@ function handleEvent(e) {
   }
 }
 
-function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function esc(s) { var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
 function copyGamma() {
-  const ta = document.getElementById('gammaContent');
+  var ta = document.getElementById('gammaContent');
+  if (!ta) return;
   ta.select();
-  navigator.clipboard.writeText(ta.value).then(() => {
-    const msg = document.getElementById('copyMsg');
-    msg.style.display = 'inline';
-    setTimeout(() => msg.style.display = 'none', 2000);
-  });
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(ta.value).then(function() {
+      var msg = document.getElementById('copyMsg');
+      if (msg) { msg.style.display = 'inline'; setTimeout(function() { msg.style.display = 'none'; }, 2000); }
+    }).catch(function() {
+      document.execCommand('copy');
+    });
+  } else {
+    document.execCommand('copy');
+  }
 }
+
+window.addEventListener('beforeunload', function(e) {
+  if (controller) { e.preventDefault(); e.returnValue = ''; }
+});
 </script>
 </body>
 </html>
