@@ -331,11 +331,16 @@ async def format_deck_for_gamma(deck_plan: dict) -> str:
     return "\n\n".join(parts)
 
 
-async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> dict:
-    """Send deck plan to Gamma API for professional design + PPTX export."""
+async def generate_via_gamma(deck_plan: dict, theme: str = "professional"):
+    """Async generator: yields heartbeat dicts during Gamma polling, then yields the final result dict.
+
+    Heartbeat events: {"heartbeat": True, "message": "..."}
+    Final result: {"gamma_url": ..., "file_path": ..., ...} or {"error": ...}
+    """
     gamma_key = os.environ.get("GAMMA_API_KEY", "")
     if not gamma_key:
-        return {"error": "GAMMA_API_KEY not configured", "gamma_url": None, "file_path": None}
+        yield {"error": "GAMMA_API_KEY not configured", "gamma_url": None, "file_path": None}
+        return
 
     input_text = await format_deck_for_gamma(deck_plan)
     tone_map = {
@@ -367,10 +372,15 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
         gen_id = gen.get("id")
 
         if not gen_id:
-            return {"error": "Gamma returned no generation ID", "gamma_url": None, "file_path": None}
+            yield {"error": "Gamma returned no generation ID", "gamma_url": None, "file_path": None}
+            return
 
-        for _ in range(40):
+        for poll_num in range(40):
             await asyncio.sleep(3)
+            # Emit a heartbeat every other poll (~6s) to keep SSE alive
+            if poll_num % 2 == 1:
+                elapsed_s = (poll_num + 1) * 3
+                yield {"heartbeat": True, "message": f"Gamma designing slides... ({elapsed_s}s)"}
             try:
                 status_resp = await client.get(
                     f"https://public-api.gamma.app/v1.0/generations/{gen_id}",
@@ -392,7 +402,8 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                     parsed = urlparse(download_url)
                     ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
                     if parsed.hostname not in ALLOWED_HOSTS:
-                        return {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
+                        yield {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
+                        return
                     # SSRF protection: resolve hostname asynchronously, reject private IPs
                     # We keep the original URL for the download (TLS needs the real hostname)
                     # since the allowlist already limits to trusted Gamma domains.
@@ -401,9 +412,13 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                         addrs = await loop.getaddrinfo(parsed.hostname, parsed.port or 443)
                         resolved_ip = addrs[0][4][0]
                         if ipaddress.ip_address(resolved_ip).is_private:
-                            return {"error": "Download URL resolves to private IP", "gamma_url": None, "file_path": None}
+                            yield {"error": "Download URL resolves to private IP", "gamma_url": None, "file_path": None}
+                            return
                     except (socket.gaierror, ValueError, OSError):
-                        return {"error": "Could not resolve download URL", "gamma_url": None, "file_path": None}
+                        yield {"error": "Could not resolve download URL", "gamma_url": None, "file_path": None}
+                        return
+                    # Emit heartbeat before download (can take a few seconds)
+                    yield {"heartbeat": True, "message": "Downloading presentation file..."}
                     # Download with original URL — hostname allowlist + private IP check is sufficient
                     # (TOCTOU DNS rebinding is mitigated by the strict hostname allowlist)
                     dl = await client.get(download_url)
@@ -414,16 +429,18 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                     with open(file_path, "wb") as f:
                         f.write(dl.content)
 
-                return {
+                yield {
                     "gamma_url": gamma_url,
                     "file_path": file_path,
                     "gen_id": gen_id,
                 }
+                return
 
             elif status.get("status") == "failed":
-                return {"error": "Gamma generation failed", "gamma_url": None, "file_path": None}
+                yield {"error": "Gamma generation failed", "gamma_url": None, "file_path": None}
+                return
 
-        return {"error": "Gamma generation timed out", "gamma_url": None, "file_path": None}
+        yield {"error": "Gamma generation timed out", "gamma_url": None, "file_path": None}
 
 
 # ============================================================
@@ -530,8 +547,16 @@ async def generate(request: Request, _=Depends(verify_auth)):
         if os.environ.get("GAMMA_API_KEY", ""):
             yield f"data: {json.dumps({'event': 'agent_start', 'agent': 'gamma', 'message': 'Gamma Design Engine: Creating professional slides...'})}\n\n"
             try:
-                gamma_result = await generate_via_gamma(deck_plan, req.theme)
-                if gamma_result.get("error"):
+                gamma_result = None
+                async for gamma_event in generate_via_gamma(deck_plan, req.theme):
+                    if gamma_event.get("heartbeat"):
+                        yield f"data: {json.dumps({'event': 'heartbeat', 'agent': 'gamma', 'message': gamma_event['message']})}\n\n"
+                    else:
+                        gamma_result = gamma_event
+                if gamma_result is None:
+                    yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': 'Gamma returned no result'})}\n\n"
+                    yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
+                elif gamma_result.get("error"):
                     yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': gamma_result['error']})}\n\n"
                     yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
                 else:
@@ -866,6 +891,7 @@ function updateLastRow(status, msg) {
 }
 
 var controller;
+var isGenerating = false;
 var elapsedInterval;
 var stallInterval;
 var lastEventTime = 0;
@@ -930,6 +956,7 @@ async function generate() {
   var result = document.getElementById('result');
 
   controller = new AbortController();
+  isGenerating = true;
   btn.disabled = true;
   btn.textContent = 'Agents running...';
   document.getElementById('cancelBtn').style.display = 'block';
@@ -1017,6 +1044,7 @@ async function generate() {
       if (errMsg.indexOf('429') !== -1) startRetryCountdown();
     }
   }
+  isGenerating = false;
   stopTimer();
   btn.disabled = false; btn.textContent = 'Generate Deck';
   document.getElementById('cancelBtn').style.display = 'none';
@@ -1026,6 +1054,7 @@ async function generate() {
 function cancelGeneration() {
   if (!confirm('Cancel deck generation? You will need to start over.')) return;
   if (controller) controller.abort();
+  isGenerating = false;
   stopTimer();
   document.getElementById('cancelBtn').style.display = 'none';
   var btn = document.getElementById('genBtn');
@@ -1211,7 +1240,7 @@ function showSlideClampMsg(msg) {
 }
 
 window.addEventListener('beforeunload', function(e) {
-  if (controller) { e.preventDefault(); e.returnValue = ''; }
+  if (isGenerating) { e.preventDefault(); e.returnValue = ''; }
 });
 </script>
 </body>
