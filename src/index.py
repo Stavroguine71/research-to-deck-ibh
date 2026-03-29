@@ -403,9 +403,12 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional"):
                 if download_url:
                     from urllib.parse import urlparse
                     parsed = urlparse(download_url)
-                    ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
-                    if parsed.hostname not in ALLOWED_HOSTS:
-                        yield {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
+                    ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app", "storage.googleapis.com", "storage.cloud.google.com"}
+                    # Also allow any subdomain of gamma.app
+                    is_gamma_subdomain = parsed.hostname and parsed.hostname.endswith(".gamma.app")
+                    if parsed.hostname not in ALLOWED_HOSTS and not is_gamma_subdomain:
+                        logger.warning(f"Gamma download URL has untrusted host: {parsed.hostname}")
+                        yield {"error": f"Untrusted download host: {parsed.hostname}", "gamma_url": None, "file_path": None}
                         return
                     # SSRF protection: resolve hostname asynchronously, reject private IPs
                     # We keep the original URL for the download (TLS needs the real hostname)
