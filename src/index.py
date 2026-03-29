@@ -167,6 +167,7 @@ async def verify_auth(
     # Session cookie auth (browser UI)
     if session and session in SESSIONS:
         return
+    logger.warning(f"Auth failed: cookie={'present' if session else 'missing'}, sessions_count={len(SESSIONS)}, cookie_in_sessions={session in SESSIONS if session else 'N/A'}")
     raise HTTPException(status_code=401, detail="Unauthorized. Please reload the page or provide a valid API key.")
 
 
@@ -489,9 +490,12 @@ async def home(request: Request):
     request.state.csp_nonce = nonce
     html = HTML_PAGE.replace("{{NONCE}}", nonce)
     response = HTMLResponse(html)
+    # Set Secure flag based on original protocol (Railway terminates TLS at proxy)
+    is_secure = request.headers.get("x-forwarded-proto", "http") == "https"
     response.set_cookie(
         "session", session_id,
-        httponly=True, samesite="strict", secure=True, max_age=MAX_JOB_AGE,
+        httponly=True, samesite="lax", secure=is_secure, max_age=MAX_JOB_AGE,
+        path="/",
     )
     return response
 
@@ -995,6 +999,7 @@ async function generate() {
     var res = await fetch('/api/generate', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -1033,7 +1038,7 @@ async function generate() {
       result.classList.add('active');
       var errMsg = e.message || 'Network error';
       var recoveryBtn = '';
-      if (errMsg.indexOf('401') !== -1) {
+      if (errMsg.indexOf('401') !== -1 || errMsg.indexOf('Unauthorized') !== -1) {
         recoveryBtn = '<button class="btn" style="margin-top:1rem;" data-action="reload">Reload Page</button>';
       } else if (errMsg.indexOf('429') !== -1) {
         recoveryBtn = '<p style="color:var(--yellow);margin-top:0.5rem;" id="retryCountdown">Please wait...</p>';
