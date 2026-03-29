@@ -203,8 +203,9 @@ async def run_pipeline(
                     break
                 else:
                     issues = "; ".join(v.get("issues", [])[:2])
-                    # Store feedback for retry so the agent can fix specific issues
-                    validation_feedback = f"Score: {v.get('score')}/10. Issues: {'; '.join(v.get('issues', []))}"
+                    # Store feedback for retry (wrapped in tags to prevent injection)
+                    raw_issues = '; '.join(v.get('issues', []))
+                    validation_feedback = f"Score: {v.get('score')}/10. Issues: <validator_feedback>{raw_issues}</validator_feedback>"
                     yield {
                         "event": "rejected",
                         "agent": "validator",
@@ -263,7 +264,15 @@ async def run_pipeline(
     except Exception as e:
         logger.exception("Reviewer agent failed")
         yield {"event": "agent_error", "agent": "reviewer", "message": f"Reviewer error: {type(e).__name__}. Using unreviewed content."}
-        review = {**content_result, "overall_score": "N/A"}
+        review = {
+            **content_result,
+            "overall_score": "N/A",
+            "slides_rewritten": 0,
+            "narrative_coherence": "Review skipped due to error",
+            "counterarguments_addressed": False,
+            "actionable_ask_present": False,
+            "weakest_dimension": "unknown",
+        }
 
     total_elapsed = round(time.time() - pipeline_start, 1)
 

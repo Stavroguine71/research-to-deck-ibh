@@ -75,20 +75,24 @@ async def call_claude(
         except httpx.HTTPStatusError as e:
             # Only retry without thinking for 400/529 errors
             if thinking_budget > 0 and e.response.status_code in (400, 529):
+                logger.warning(f"Claude API {e.response.status_code} with thinking enabled, retrying without thinking")
                 body.pop("thinking", None)
                 body.pop("temperature", None)
                 headers.pop("anthropic-beta", None)
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+                try:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=body,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except httpx.HTTPStatusError as retry_err:
+                    raise RuntimeError(
+                        f"Claude API call failed after retry (status {retry_err.response.status_code})"
+                    ) from retry_err
             else:
                 raise
-        except Exception:
-            raise
 
     elapsed = round(time.time() - start, 1)
 
@@ -138,20 +142,21 @@ def parse_json_response(text: str) -> dict:
                 except json.JSONDecodeError:
                     continue
 
-    # Third try: extract JSON array
+    # Third try: extract JSON array (log warning — callers should validate structure)
     for i, ch in enumerate(cleaned):
         if ch == '[':
             try:
                 arr = json.loads(cleaned[i:])
-                return {"slides": arr}
+                logger.warning("parse_json_response: Got JSON array instead of object — wrapping as {items: [...]}")
+                return {"items": arr, "_was_array": True}
             except json.JSONDecodeError:
                 decoder = json.JSONDecoder()
                 try:
                     arr, _ = decoder.raw_decode(cleaned, i)
-                    return {"slides": arr}
+                    logger.warning("parse_json_response: Got JSON array instead of object — wrapping as {items: [...]}")
+                    return {"items": arr, "_was_array": True}
                 except json.JSONDecodeError:
                     continue
 
-    raise ValueError(
-        f"Could not parse JSON from Claude response (first 200 chars): {text[:200]}"
-    )
+    logger.error(f"Could not parse JSON from Claude response (first 200 chars): {text[:200]}")
+    raise ValueError("Could not parse JSON from Claude response")

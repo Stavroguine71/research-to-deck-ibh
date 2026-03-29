@@ -8,6 +8,7 @@ ran these sequentially. Now they fan out concurrently.
 
 import asyncio
 import os
+import re
 import httpx
 
 async def _tavily_search(query: str, max_results: int = 5) -> dict:
@@ -44,11 +45,13 @@ class ResearcherAgent:
         Fan out 4 research queries concurrently.
         Returns consolidated research data.
         """
+        # Sanitize topic: strip search operators, limit length
+        safe_topic = re.sub(r'[^\w\s.,!?()\'"-]', '', topic)[:200].strip()
         queries = [
-            f"{topic} latest data statistics trends 2024 2025",
-            f"{topic} competitive landscape market analysis key players",
-            f"{topic} strategic implications risks opportunities",
-            f"{topic} expert analysis outlook recommendations",
+            f"{safe_topic} latest data statistics trends 2024 2025",
+            f"{safe_topic} competitive landscape market analysis key players",
+            f"{safe_topic} strategic implications risks opportunities",
+            f"{safe_topic} expert analysis outlook recommendations",
         ]
 
         # PARALLEL fan-out — all 4 queries run at the same time

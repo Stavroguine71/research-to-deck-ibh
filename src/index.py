@@ -82,6 +82,9 @@ async def security_headers(request: Request, call_next):
 APP_API_KEY = os.environ.get("APP_API_KEY", "")
 TMPDIR = tempfile.mkdtemp()
 
+# Async lock for shared in-memory state (SESSIONS, JOBS, RATE_LIMIT, SESSION_RATE_LIMIT)
+_state_lock = asyncio.Lock()
+
 # Session tokens for cookie-based UI auth
 SESSIONS: dict = {}  # session_id -> creation_time
 MAX_SESSIONS = 50000
@@ -114,28 +117,34 @@ async def startup():
 # ============================================================
 
 async def cleanup_loop():
-    """Runs on the same event loop as the app — no race conditions."""
+    """Runs on the same event loop as the app — uses lock for safe dict access."""
     while True:
-        await asyncio.sleep(60)  # Every minute instead of 10 min
+        await asyncio.sleep(60)  # Every minute
         now = time.time()
-        # Clean expired jobs and temp files
-        expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
-        for jid in expired:
-            info = JOBS.pop(jid, None)
-            if info and os.path.exists(info["path"]):
-                try:
-                    os.remove(info["path"])
-                except OSError:
-                    pass
-        # Clean stale rate limit entries
-        window_start = now - RATE_LIMIT_WINDOW
-        stale_ips = [ip for ip, ts in RATE_LIMIT.items() if not any(t > window_start for t in ts)]
-        for ip in stale_ips:
-            RATE_LIMIT.pop(ip, None)
-        # Clean expired sessions
-        expired_sessions = [sid for sid, created in SESSIONS.items() if now - created > MAX_JOB_AGE]
-        for sid in expired_sessions:
-            SESSIONS.pop(sid, None)
+        async with _state_lock:
+            # Clean expired jobs and temp files
+            expired = [jid for jid, info in JOBS.items() if now - info["created_at"] > MAX_JOB_AGE]
+            for jid in expired:
+                info = JOBS.pop(jid, None)
+                if info and os.path.exists(info["path"]):
+                    try:
+                        os.remove(info["path"])
+                    except OSError:
+                        pass
+            # Clean stale rate limit entries
+            window_start = now - RATE_LIMIT_WINDOW
+            stale_ips = [ip for ip, ts in RATE_LIMIT.items() if not any(t > window_start for t in ts)]
+            for ip in stale_ips:
+                RATE_LIMIT.pop(ip, None)
+            # Clean stale session rate limit entries
+            stale_session_ips = [ip for ip, ts in SESSION_RATE_LIMIT.items()
+                                 if not any(t > window_start for t in ts)]
+            for ip in stale_session_ips:
+                SESSION_RATE_LIMIT.pop(ip, None)
+            # Clean expired sessions
+            expired_sessions = [sid for sid, created in SESSIONS.items() if now - created > MAX_JOB_AGE]
+            for sid in expired_sessions:
+                SESSIONS.pop(sid, None)
 
 
 # ============================================================
@@ -173,29 +182,30 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def check_rate_limit(request: Request):
-    """In-memory rate limiter by IP."""
+async def check_rate_limit(request: Request):
+    """In-memory rate limiter by IP. Uses lock for safe dict access."""
     ip = get_client_ip(request)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW
 
-    if ip in RATE_LIMIT:
-        RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if t > window_start]
-    else:
-        RATE_LIMIT[ip] = []
+    async with _state_lock:
+        if ip in RATE_LIMIT:
+            RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if t > window_start]
+        else:
+            RATE_LIMIT[ip] = []
 
-    if len(RATE_LIMIT[ip]) >= RATE_LIMIT_MAX:
-        remaining = max(1, int(RATE_LIMIT_WINDOW - (now - RATE_LIMIT[ip][0])))
-        raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {remaining} seconds.")
+        if len(RATE_LIMIT[ip]) >= RATE_LIMIT_MAX:
+            remaining = max(1, int(RATE_LIMIT_WINDOW - (now - RATE_LIMIT[ip][0])))
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {remaining} seconds.")
 
-    RATE_LIMIT[ip].append(now)
+        RATE_LIMIT[ip].append(now)
 
-    # Bulk evict oldest 10% of entries if dict grows too large (DoS protection)
-    if len(RATE_LIMIT) > MAX_RATE_ENTRIES:
-        sorted_ips = sorted(RATE_LIMIT.items(), key=lambda kv: kv[1][0] if kv[1] else 0)
-        evict_count = max(1, len(sorted_ips) // 10)
-        for ip_key, _ in sorted_ips[:evict_count]:
-            RATE_LIMIT.pop(ip_key, None)
+        # Bulk evict oldest 10% of entries if dict grows too large (DoS protection)
+        if len(RATE_LIMIT) > MAX_RATE_ENTRIES:
+            sorted_ips = sorted(RATE_LIMIT.items(), key=lambda kv: kv[1][0] if kv[1] else 0)
+            evict_count = max(1, len(sorted_ips) // 10)
+            for ip_key, _ in sorted_ips[:evict_count]:
+                RATE_LIMIT.pop(ip_key, None)
 
 
 # ============================================================
@@ -383,14 +393,18 @@ async def generate_via_gamma(deck_plan: dict, theme: str = "professional") -> di
                     ALLOWED_HOSTS = {"gamma.app", "public-api.gamma.app", "cdn.gamma.app"}
                     if parsed.hostname not in ALLOWED_HOSTS:
                         return {"error": "Untrusted download URL from Gamma", "gamma_url": None, "file_path": None}
-                    # DNS rebinding protection: resolve hostname and reject private IPs
+                    # DNS rebinding protection: resolve hostname, reject private IPs, pin resolved IP
                     try:
-                        resolved_ip = socket.getaddrinfo(parsed.hostname, None)[0][4][0]
+                        loop = asyncio.get_event_loop()
+                        addrs = await loop.getaddrinfo(parsed.hostname, parsed.port or 443)
+                        resolved_ip = addrs[0][4][0]
                         if ipaddress.ip_address(resolved_ip).is_private:
                             return {"error": "Download URL resolves to private IP", "gamma_url": None, "file_path": None}
-                    except (socket.gaierror, ValueError):
+                    except (socket.gaierror, ValueError, OSError):
                         return {"error": "Could not resolve download URL", "gamma_url": None, "file_path": None}
-                    dl = await client.get(download_url)
+                    # Download using pinned IP to prevent TOCTOU DNS rebinding
+                    pinned_url = download_url.replace(f"://{parsed.hostname}", f"://{resolved_ip}")
+                    dl = await client.get(pinned_url, headers={"Host": parsed.hostname})
                     dl.raise_for_status()
                     # Use a local UUID for the filename — never trust gen_id from API
                     safe_filename = str(uuid.uuid4())
@@ -421,26 +435,36 @@ SESSION_RATE_WINDOW = 60  # 1 minute
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    # Rate-limit session creation to prevent flooding
+    # Rate-limit session creation + create session under lock
     ip = get_client_ip(request)
     now = time.time()
-    window_start = now - SESSION_RATE_WINDOW
-    if ip in SESSION_RATE_LIMIT:
-        SESSION_RATE_LIMIT[ip] = [t for t in SESSION_RATE_LIMIT[ip] if t > window_start]
-    else:
-        SESSION_RATE_LIMIT[ip] = []
-    if len(SESSION_RATE_LIMIT[ip]) >= SESSION_RATE_MAX:
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
-    SESSION_RATE_LIMIT[ip].append(now)
-
     session_id = secrets.token_urlsafe(32)
-    SESSIONS[session_id] = time.time()
-    # Bulk evict oldest 10% of sessions if too many
-    if len(SESSIONS) > MAX_SESSIONS:
-        sorted_sessions = sorted(SESSIONS.items(), key=lambda x: x[1])
-        evict_count = max(1, len(sorted_sessions) // 10)
-        for sid, _ in sorted_sessions[:evict_count]:
-            SESSIONS.pop(sid, None)
+
+    async with _state_lock:
+        # Session rate limit
+        window_start = now - SESSION_RATE_WINDOW
+        if ip in SESSION_RATE_LIMIT:
+            SESSION_RATE_LIMIT[ip] = [t for t in SESSION_RATE_LIMIT[ip] if t > window_start]
+        else:
+            SESSION_RATE_LIMIT[ip] = []
+        if len(SESSION_RATE_LIMIT[ip]) >= SESSION_RATE_MAX:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
+        SESSION_RATE_LIMIT[ip].append(now)
+        # Cap SESSION_RATE_LIMIT size
+        if len(SESSION_RATE_LIMIT) > MAX_RATE_ENTRIES:
+            sorted_srl = sorted(SESSION_RATE_LIMIT.items(), key=lambda kv: kv[1][0] if kv[1] else 0)
+            evict_count = max(1, len(sorted_srl) // 10)
+            for ip_key, _ in sorted_srl[:evict_count]:
+                SESSION_RATE_LIMIT.pop(ip_key, None)
+
+        # Create session
+        SESSIONS[session_id] = now
+        # Bulk evict oldest 10% of sessions if too many
+        if len(SESSIONS) > MAX_SESSIONS:
+            sorted_sessions = sorted(SESSIONS.items(), key=lambda x: x[1])
+            evict_count = max(1, len(sorted_sessions) // 10)
+            for sid, _ in sorted_sessions[:evict_count]:
+                SESSIONS.pop(sid, None)
     # Generate nonce for CSP
     nonce = secrets.token_urlsafe(16)
     request.state.csp_nonce = nonce
@@ -457,20 +481,24 @@ async def home(request: Request):
 async def generate(request: Request, _=Depends(verify_auth)):
     """Stream the multi-agent pipeline progress, then generate via Gamma."""
     # Parse and validate body BEFORE consuming a rate limit slot
+    raw_body = await request.body()
+    if len(raw_body) > 10_000:
+        raise HTTPException(status_code=413, detail="Request body too large")
     try:
-        body = await request.json()
-    except Exception:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, Exception):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     try:
         req = DeckRequest(**body)
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid request. Check topic, num_slides (5-25), and field values.")
 
-    check_rate_limit(request)
+    await check_rate_limit(request)
 
-    # Reject if too many active jobs
-    if len(JOBS) >= MAX_JOBS:
-        raise HTTPException(status_code=503, detail="Server busy. Please try again in a few minutes.")
+    # Reject if too many active jobs (checked under lock)
+    async with _state_lock:
+        if len(JOBS) >= MAX_JOBS:
+            raise HTTPException(status_code=503, detail="Server busy. Please try again in a few minutes.")
 
     audience_context = build_audience_context(req)
 
@@ -505,11 +533,14 @@ async def generate(request: Request, _=Depends(verify_auth)):
                     yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': gamma_result['error']})}\n\n"
                     yield f"data: {json.dumps({'event': 'complete', 'gamma_content': gamma_text})}\n\n"
                 else:
-                    job_id = str(uuid.uuid4())
-                    if gamma_result.get("file_path"):
-                        JOBS[job_id] = {"path": gamma_result["file_path"], "created_at": time.time()}
                     yield f"data: {json.dumps({'event': 'agent_complete', 'agent': 'gamma', 'message': 'Gamma design complete'})}\n\n"
-                    yield f"data: {json.dumps({'event': 'complete', 'job_id': job_id, 'gamma_url': gamma_result.get('gamma_url')})}\n\n"
+                    event_data = {'event': 'complete', 'gamma_url': gamma_result.get('gamma_url')}
+                    if gamma_result.get("file_path"):
+                        job_id = str(uuid.uuid4())
+                        async with _state_lock:
+                            JOBS[job_id] = {"path": gamma_result["file_path"], "created_at": time.time()}
+                        event_data['job_id'] = job_id
+                    yield f"data: {json.dumps(event_data)}\n\n"
             except Exception as e:
                 logger.exception("Gamma API error")
                 yield f"data: {json.dumps({'event': 'agent_error', 'agent': 'gamma', 'message': 'Gamma design failed'})}\n\n"
@@ -535,7 +566,8 @@ async def download(job_id: str, request: Request, _=Depends(verify_auth)):
         uuid.UUID(job_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid job ID")
-    info = JOBS.get(job_id)
+    async with _state_lock:
+        info = JOBS.get(job_id)
     if not info or not os.path.exists(info["path"]):
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
@@ -574,7 +606,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <style>
   :root {
     --bg: #0a0b10; --surface: #12131a; --surface2: #1a1b25;
-    --border: #2a2b3a; --text: #e0e0e8; --text-dim: #a0a0b8;
+    --border: #2a2b3a; --text: #e0e0e8; --text-dim: #b8b8cc;
     --accent: #7c6aff; --accent-glow: rgba(124,106,255,0.15);
     --green: #34d399; --yellow: #fbbf24; --red: #f87171; --blue: #60a5fa;
   }
@@ -833,6 +865,8 @@ function updateLastRow(status, msg) {
 
 var controller;
 var elapsedInterval;
+var stallInterval;
+var lastEventTime = 0;
 var stepCount = 0;
 var TOTAL_STEPS = 6;
 
@@ -848,6 +882,18 @@ function startTimer() {
 function stopTimer() {
   if (elapsedInterval) clearInterval(elapsedInterval);
   elapsedInterval = null;
+  if (stallInterval) clearInterval(stallInterval);
+  stallInterval = null;
+}
+
+function startStallDetector() {
+  lastEventTime = Date.now();
+  stallInterval = setInterval(function() {
+    if (Date.now() - lastEventTime > 60000) {
+      addAgentRow('warning', 'No events received for 60s — connection may have dropped. You can wait or cancel.', 'rejected');
+      lastEventTime = Date.now();
+    }
+  }, 10000);
 }
 
 var PHASE_PROGRESS = {researcher:16, brief:33, architect:50, writer:67, reviewer:83, gamma:100};
@@ -895,6 +941,7 @@ async function generate() {
   stepCount = 0;
   resetSteps();
   startTimer();
+  startStallDetector();
 
   addAgentRow('system', 'Connecting to pipeline...', 'running');
 
@@ -942,7 +989,7 @@ async function generate() {
       buffer = lines.pop();
       for (var i = 0; i < lines.length; i++) {
         if (!lines[i].startsWith('data: ')) continue;
-        try { handleEvent(JSON.parse(lines[i].slice(6))); } catch(e) {}
+        try { lastEventTime = Date.now(); handleEvent(JSON.parse(lines[i].slice(6))); } catch(e) {}
       }
     }
     // Process any remaining data in the buffer after stream ends
@@ -1059,11 +1106,11 @@ function handleEvent(e) {
       var timer = document.getElementById('elapsedTimer');
       var elapsed = timer ? timer.textContent : '';
       var html = '';
-      if (e.gamma_url) {
+      if (e.gamma_url && e.gamma_url.startsWith('https://')) {
         html += '<h2 class="result-header">Deck Ready</h2>';
         if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
         if (e.job_id) html += '<a class="dl-btn" href="/api/download/'+esc(e.job_id)+'" download="presentation.pptx" style="margin-right:0.75rem;">Download PPTX</a>';
-        html += '<a class="dl-btn" href="'+esc(e.gamma_url)+'" target="_blank">Edit in Gamma</a>';
+        html += '<a class="dl-btn" href="'+esc(e.gamma_url)+'" target="_blank" rel="noopener noreferrer">Edit in Gamma</a>';
       } else if (e.gamma_content) {
         html += '<h2 class="result-header">Deck Ready</h2>';
         if (elapsed) html += '<p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:0.75rem;">Generated in '+esc(elapsed)+'</p>';
@@ -1142,8 +1189,23 @@ function clampSlides() {
   var el = document.getElementById('numSlides');
   if (!el) return;
   var v = parseInt(el.value);
-  if (isNaN(v) || v < 5) el.value = 5;
-  else if (v > 25) el.value = 25;
+  var msg = '';
+  if (isNaN(v) || v < 5) { el.value = 5; msg = 'Minimum is 5 slides'; }
+  else if (v > 25) { el.value = 25; msg = 'Maximum is 25 slides'; }
+  showSlideClampMsg(msg);
+}
+
+function showSlideClampMsg(msg) {
+  var existing = document.getElementById('slideClampMsg');
+  if (existing) existing.remove();
+  if (!msg) return;
+  var el = document.getElementById('numSlides');
+  var span = document.createElement('span');
+  span.id = 'slideClampMsg';
+  span.style.cssText = 'font-size:0.75rem;color:var(--yellow);display:block;margin-top:-0.5rem;margin-bottom:0.5rem;';
+  span.textContent = msg;
+  el.parentNode.appendChild(span);
+  setTimeout(function() { var s = document.getElementById('slideClampMsg'); if (s) s.remove(); }, 4000);
 }
 
 window.addEventListener('beforeunload', function(e) {
